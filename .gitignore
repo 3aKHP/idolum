@@ -1,0 +1,18 @@
+# 密钥与本机配置
+.env
+.env.*
+!.env.example
+.claude/settings.local.json
+.agents/skills/openai-image/config.json
+
+# .claude/skills 下是指向本机绝对路径的符号链接，由 skills-lock.json 还原
+.claude/skills/
+
+# impeccable 按机器安装（含平台二进制），各 agent 目录各有一份
+.impeccable/
+.claude/agents/impeccable-*.md
+.dsh/
+.pi/
+
+# 浏览器调研产物
+.playwright-mcp/
