@@ -28,10 +28,9 @@ permissions:
 
 jobs:
   find:
-    # 玩法仓库登记不是问题或建议，交给 fork-showcase.yml
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event.issue.user.type != 'Bot' && !contains(github.event.issue.labels.*.name, 'fork-showcase'))
+      github.event.issue.user.type != 'Bot'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
