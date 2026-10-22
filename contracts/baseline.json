@@ -1,0 +1,23 @@
+{
+  "oracle": {
+    "implementation": "python",
+    "repo": "3aKHP/idolum",
+    "commit": "b53069a25c67f94dfbb23611f5061fd0008cd334",
+    "captured_at": "2026-10-23",
+    "description": "The inherited Python backend is the behavior reference for this line (ADR-0029). The Go rewrite answers to the contracts recorded here; every intentional difference is a deviation entry below, none are silent."
+  },
+  "contracts": {
+    "http": "openapi.json",
+    "database": "schema.sql",
+    "rtvi": "rtvi/"
+  },
+  "deviations": [],
+  "deviation_shape": {
+    "id": "D-001",
+    "contract": "openapi.json | schema.sql | rtvi/<file>",
+    "summary": "one line: what intentionally differs",
+    "reason": "why the difference is wanted",
+    "decided": "YYYY-MM-DD",
+    "adr": "optional: docs/adr/ number if the deviation got its own ADR"
+  }
+}
