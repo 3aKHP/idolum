@@ -63,7 +63,7 @@ docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
 ```
 
-前端和后端用 CI 发布到 GHCR 的镜像（`ghcr.io/sallyn0225/eidolon-sc-frontend`、`-backend`），服务器上不用构建。镜像只有 linux/amd64 一种。arm64 的服务器，或者想用自己改过的代码时，改用 `up -d --build` 在服务器上构建。
+前端和后端用 CI 发布到 GHCR 的镜像（`ghcr.io/3akhp/idolum-frontend`、`-backend`），服务器上不用构建。镜像只有 linux/amd64 一种。arm64 的服务器，或者想用自己改过的代码时，改用 `up -d --build` 在服务器上构建。
 
 第一次启动时 Caddy 会申请证书，稍等片刻后用浏览器打开 `https://你的域名`。后端启动失败时（缺少人设文件、对话模型检查不通过等），用 `docker compose -f docker-compose.prod.yml logs backend` 查看原因。
 
@@ -630,17 +630,9 @@ db.commit()
 
 想先试效果：在 Actions 页面选 Issue duplicates，点 Run workflow，填一个 issue 编号，不勾「找到了就评论」，结果只出现在运行日志里。本机看给 LLM 的材料：`python3 scripts/issue_duplicates.py 159 --dry-run`。
 
-### 玩法仓库登记
-
-有人用「玩法仓库登记」模板开 issue 时，Fork showcase workflow 会检查仓库地址：能不能打开、是不是公开、仓库名是不是还叫 eidolon-sc（[`scripts/fork_showcase.py`](../scripts/fork_showcase.py)）。结果写在一条评论里，对方编辑 issue 后会更新这条评论；没通过就打 `needs-info`，通过了就摘掉。
-
-看过对方仓库、觉得可以收录，就给 issue 打上 `accepted` 标签。workflow 会再查一遍，然后把这一条写进 [`docs/community-forks.md`](community-forks.md) 里对应分级的一节，提交到 main，评论并关闭 issue。这次提交不会触发 CI。之后要改简介或下线某一条，直接改这份文档，每一条行末的注释里记着登记 issue 的编号。
-
-本机看会写进文档的那一行：`python3 scripts/fork_showcase.py accept 171 --dry-run`。
-
 ### 镜像的可见性
 
-CI 第一次发布后，GHCR 上的两个包跟随仓库，默认是私有的，服务器拉不下来。到 GitHub 个人主页的 Packages，分别打开 `eidolon-sc-backend` 和 `eidolon-sc-frontend`，在 Package settings 的 Danger Zone 里改成 Public。公开的包不占账号的存储和流量额度，服务器不用登录就能拉取。改成公开后不能再改回私有。注意后端镜像里有 `backend/src` 的全部源代码，前端镜像里有构建后的前端代码：包公开就等于这部分代码公开了，即使仓库还是私有的。
+CI 第一次发布后，GHCR 上的两个包跟随仓库，默认是私有的，服务器拉不下来。到 GitHub 个人主页的 Packages，分别打开 `idolum-backend` 和 `idolum-frontend`，在 Package settings 的 Danger Zone 里改成 Public。公开的包不占账号的存储和流量额度，服务器不用登录就能拉取。改成公开后不能再改回私有。注意后端镜像里有 `backend/src` 的全部源代码，前端镜像里有构建后的前端代码：包公开就等于这部分代码公开了，即使仓库还是私有的。
 
 不想公开时，包保持私有，在服务器上用一个只有 `read:packages` 权限的 GitHub 令牌（classic personal access token）登录一次：`echo <令牌> | docker login ghcr.io -u <GitHub 用户名> --password-stdin`。
 
