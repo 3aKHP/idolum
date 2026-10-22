@@ -8,7 +8,7 @@ Voice · Text · Story recall · Memory shared across characters
 
 [简体中文](README.md) · **English** · [日本語](README.ja.md)
 
-[![CI](https://img.shields.io/github/actions/workflow/status/Sallyn0225/eidolon-sc/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/Sallyn0225/eidolon-sc/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/3aKHP/idolum/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/3aKHP/idolum/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](backend/pyproject.toml)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Pipecat](https://img.shields.io/badge/Pipecat-WebRTC-6E56CF?style=flat-square)](https://github.com/pipecat-ai/pipecat)
@@ -122,7 +122,7 @@ All **28 idols** from the game's eight units, plus the office clerk Nanakusa Haz
 You need Docker with Docker Compose, and a chat model that supports streaming and tool calling.
 
 ```sh
-git clone https://github.com/Sallyn0225/eidolon-sc.git && cd eidolon-sc
+git clone https://github.com/3aKHP/idolum.git && cd idolum
 cp .env.example .env    # fill in CHAT_LLM_BASE_URL, CHAT_LLM_API_KEY and CHAT_LLM_MODEL, then add the line EIDOLON_DEV_LOGIN=1
 docker compose up --build
 ```

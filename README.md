@@ -8,7 +8,7 @@
 
 **简体中文** · [English](README.en.md) · [日本語](README.ja.md)
 
-[![CI](https://img.shields.io/github/actions/workflow/status/Sallyn0225/eidolon-sc/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/Sallyn0225/eidolon-sc/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/3aKHP/idolum/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI)](https://github.com/3aKHP/idolum/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](backend/pyproject.toml)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![Pipecat](https://img.shields.io/badge/Pipecat-WebRTC-6E56CF?style=flat-square)](https://github.com/pipecat-ai/pipecat)
@@ -22,6 +22,9 @@
 </div>
 
 ---
+
+> [!NOTE]
+> 本仓库 **idolum** 基于 [Sallyn0225/eidolon-sc](https://github.com/Sallyn0225/eidolon-sc) 独立维护，分叉点是 `f2a8978`（2026-10-22 的上游 main）。仓库名的来历与本线的规划见 [ADR-0029](docs/adr/0029-independent-line-with-a-go-backend-later.md)。
 
 Eidolon-SC 让你以 **283 事务所制作人**的身份，和原作中的偶像打字聊天或者直接打电话。她用日语原声回答，附上中文字幕；能回忆自己在原作里经历过的剧情；还会记住你说过的事，并在偶像之间「传开」。
 
@@ -122,7 +125,7 @@ Eidolon-SC 让你以 **283 事务所制作人**的身份，和原作中的偶像
 需要 Docker 与 Docker Compose，以及一个支持流式输出和工具调用的对话模型。
 
 ```sh
-git clone https://github.com/Sallyn0225/eidolon-sc.git && cd eidolon-sc
+git clone https://github.com/3aKHP/idolum.git && cd idolum
 cp .env.example .env    # 填写 CHAT_LLM_BASE_URL、CHAT_LLM_API_KEY、CHAT_LLM_MODEL，再加一行 EIDOLON_DEV_LOGIN=1
 docker compose up --build
 ```
