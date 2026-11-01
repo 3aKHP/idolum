@@ -23,16 +23,23 @@ from eidolon.config import (
 )
 from eidolon.live_config import (
     AFFINITY,
+    BAR,
     CHAT_LLM,
+    CYCLES,
     IMAGE,
     JUDGE,
     JUDGE_THRESHOLDS,
     LIMITS,
     MEMORY_LLM,
+    LETTERS,
+    MOMENTS,
     PROXY,
+    QWEATHER,
     REACH_OUTS,
     READ_ONLY,
+    REGISTRATION,
     RERANK,
+    SCHEDULE,
     SERVICE_STATUS,
     STT,
     STT_KEY_FIELDS,
@@ -150,6 +157,8 @@ class LimitsInput(BaseModel):
     turns_per_hour: Any
     calls_per_hour: Any
     photos_per_hour: Any
+    visits_per_hour: Any
+    read_alouds_per_hour: Any
     call_minutes: Any
     turns_per_call: Any
     concurrent_calls: Any
@@ -157,6 +166,19 @@ class LimitsInput(BaseModel):
     exempting_llm: Any
     exempting_tts: Any
     exempting_stt: Any
+
+
+class QWeatherInput(BaseModel):
+    """The deployer's QWeather account; without `private_key`, the key stays as it is.
+    Checked by the live configuration, which says what is wrong in so many words."""
+
+    host: str = Field(min_length=1, max_length=200)
+    developer_id: str = Field(min_length=1, max_length=100)
+    project_id: str = Field(min_length=1, max_length=100)
+    key_id: str = Field(min_length=1, max_length=100)
+    private_key: str | None = Field(None, min_length=8, max_length=1000)
+
+    _trim = field_validator("host", "developer_id", "project_id", "key_id")(_trimmed)
 
 
 class AffinityInput(BaseModel):
@@ -171,6 +193,45 @@ class ReachOutsInput(BaseModel):
 
     enabled: Any
     per_day: Any
+
+
+class LettersInput(BaseModel):
+    """Whether characters write letters on their occasions, true or false; checked by the
+    live configuration."""
+
+    enabled: Any
+
+
+class MomentsInput(BaseModel):
+    """Whether characters post moments, true or false, how many a day each user at most, a
+    whole number from 1 up, which map their places link to, and how many of each user's
+    comments a day they reply to, a whole number from 1 up, each of the last two unchanged
+    if not given; checked by the live configuration."""
+
+    enabled: Any
+    per_day: Any
+    map: Any = None
+    replies_per_day: Any = None
+
+
+class ScheduleInput(BaseModel):
+    """Whether each week's jobs are published for producers to schedule, true or false;
+    checked by the live configuration."""
+
+    enabled: Any
+
+
+class CyclesInput(BaseModel):
+    """Whether her cycle has a part in how she is, true or false; checked by the live
+    configuration."""
+
+    enabled: Any
+
+
+class BarInput(BaseModel):
+    """Whether the bar is open, true or false; checked by the live configuration."""
+
+    enabled: Any
 
 
 class ProxyInput(BaseModel):
@@ -211,6 +272,12 @@ class ServiceStatusInput(BaseModel):
     image: StrictBool
 
 
+class RegistrationInput(BaseModel):
+    """Who may sign up, `open` or `invite`; checked by the live configuration."""
+
+    mode: Any
+
+
 INPUTS: dict[str, type[BaseModel]] = {
     CHAT_LLM: ChatLLMInput,
     MEMORY_LLM: LLMInput,
@@ -223,21 +290,31 @@ INPUTS: dict[str, type[BaseModel]] = {
     LIMITS: LimitsInput,
     AFFINITY: AffinityInput,
     REACH_OUTS: ReachOutsInput,
+    LETTERS: LettersInput,
+    MOMENTS: MomentsInput,
+    QWEATHER: QWeatherInput,
+    SCHEDULE: ScheduleInput,
+    CYCLES: CyclesInput,
+    BAR: BarInput,
     PROXY: ProxyInput,
     SERVICE_STATUS: ServiceStatusInput,
+    REGISTRATION: RegistrationInput,
 }
 
 
 def _change(item: str, body: BaseModel) -> dict[str, Any]:
     """What the input changes of the item: every field given (a model slot's max_tokens
     may be None, its protocol's default), a key, the judge model's account, workspace
-    and region and a proxy's password only if given."""
+    and region, a proxy's password and the moments' map and how many comments a day they
+    reply to only if given."""
     change = body.model_dump()
-    for field in ("account_id", "workspace_id", "region"):
+    for field in ("account_id", "workspace_id", "region", "map", "replies_per_day"):
         if change.get(field, "") is None:
             del change[field]
     if change.get("password", "") is None:
         del change["password"]
+    if change.get("private_key", "") is None:
+        del change["private_key"]
     if key := change.pop("api_key", None):
         change[STT_KEY_FIELDS[change["provider"]] if item == STT else "api_key"] = key
     return change

@@ -13,6 +13,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 import zipfile
+import zlib
 from http import HTTPStatus
 from urllib.parse import quote, unquote, urlencode
 
@@ -65,10 +66,11 @@ from eidolon.llm import (
     ToolCall,
 )
 from eidolon.llm.providers import check_chat_models
+from eidolon import official_cdn
 from eidolon.mirror import Mirror
 from eidolon.own_keys import OwnKeyRejected
 from eidolon.affinity_judge import LEVEL as AFFINITY_LEVEL
-from eidolon.affinity_judge import MANIPULATION, OUT_OF_LINE
+from eidolon.affinity_judge import CONSIDERATE_QUESTION, MANIPULATION, OUT_OF_LINE
 from eidolon.judge import SAID, JudgeError
 from eidolon.photo_judge import PHOTO
 
@@ -107,6 +109,18 @@ class FakeRandom:
         return number
 
 
+class SteadyRandom:
+    """A random source giving the same number each time, however often it is asked: for
+    tests that care what is drawn, not how many times (each ask must be for more)."""
+
+    def __init__(self, number: int) -> None:
+        self._number = number
+
+    def __call__(self, below: int) -> int:
+        assert self._number < below, f"{self._number} is not below {below}"
+        return self._number
+
+
 DEPLOYER_KEY = "test-key"
 """The deployer's chat model key in the tests' settings."""
 
@@ -142,7 +156,8 @@ class FakeLLM:
 
     Each scripted reply is a list of text chunks, tool calls and reasoning, streamed in
     order, so tests can split the structured reply at awkward boundaries or have the model
-    call a tool; a reply that is an LLMError is raised instead, as a failing service would. With
+    call a tool; a reply that is an LLMError is raised instead, as a failing service would,
+    and a chunk that is one, part-way through the reply. With
     a `delay`, it waits that many seconds before each chunk after the first, as a slow
     model would; at `HANG` it waits forever, and at an `asyncio.Event` till it is set.
     Unless reached through a FakeLLMService, it is the deployer's model. With `tokens`, each
@@ -199,6 +214,8 @@ class FakeLLM:
             if isinstance(chunk, asyncio.Event):
                 await chunk.wait()
                 continue
+            if isinstance(chunk, LLMError):
+                raise chunk
             assert isinstance(chunk, str | ToolCall | Reasoning)
             yield chunk
         if self._tokens is not None:
@@ -407,12 +424,14 @@ class _ConfiguredLLM:
 class Judging:
     """A script for what the judge model makes of one turn's affinity: how likely each
     level is (each level the only one by default, `level`), whether it is out of line,
-    whether it tries to dictate her affinity; or that the request fails."""
+    whether it tries to dictate her affinity, which of the considerate question's three it
+    is if that is asked (unrelated by default); or that the request fails."""
 
     levels: Mapping[int, float] = field(default_factory=lambda: {2: 1.0})
     out_of_line: bool = False
     manipulation: bool = False
     fails: bool = False
+    considerate: int = 1
 
     def answers(self) -> dict[str, Any]:
         return {
@@ -422,9 +441,16 @@ class Judging:
         }
 
 
-def level(n: int, **judging: bool) -> Judging:
+def level(
+    n: int,
+    *,
+    out_of_line: bool = False,
+    manipulation: bool = False,
+    fails: bool = False,
+    considerate: int = 1,
+) -> Judging:
     """A turn judged at level `n` for sure."""
-    return Judging({n: 1.0}, **judging)
+    return Judging({n: 1.0}, out_of_line, manipulation, fails, considerate)
 
 
 class FakeJudgeModel:
@@ -437,7 +463,8 @@ class FakeJudgeModel:
     recording what they said (`photo_asked`). Records the key each request came with and what
     it asked (`asked`: "turn", with or without affinity's questions and the photo's,
     "affinity" for those alone, with or without the photo's, "photo" for that alone,
-    "emotion" or "check"), and everything it was told of each (`states`)."""
+    "emotion" or "check"), and everything it was told of each (`states`) and asked of it
+    (`questions`)."""
 
     def __init__(self) -> None:
         self.needs: FakeJudge | None = None
@@ -450,6 +477,7 @@ class FakeJudgeModel:
         self.photo = 0.0
         self.photo_asked: list[str] = []
         self.states: list[dict[str, Any]] = []
+        self.questions: list[dict[str, dict]] = []
 
     async def answer(
         self, key: str, state: dict[str, Any], questions: dict[str, dict]
@@ -463,6 +491,7 @@ class FakeJudgeModel:
         )
         self.asked.append((key, kind))
         self.states.append(state)
+        self.questions.append(questions)
         scripted: dict[str, Any] = {}
         if AFFINITY_LEVEL in questions:
             self.affinity_asked.append(state[SAID])
@@ -470,6 +499,8 @@ class FakeJudgeModel:
             if judging.fails:
                 raise JudgeError("fake judge model is down")
             scripted = judging.answers()
+            if CONSIDERATE_QUESTION in questions:
+                scripted[CONSIDERATE_QUESTION] = {"probabilities": {str(judging.considerate): 1.0}}
         if PHOTO in questions:
             self.photo_asked.append(state[SAID])
             scripted |= {PHOTO: {"noul": self.photo}}
@@ -525,7 +556,12 @@ def build_faked(
     `background_llm`'s, judging what turns need from `retrieval_judge`'s and her emotions
     from `emotion_judge`'s, either judging both if only one is given. With a judge
     script, `.env` has the judge model `FAKE_JUDGE` unless it has one. Any other keyword
-    is an outside service passed on to `build`."""
+    is an outside service passed on to `build`; the weather and QWeather are fakes failing
+    by default, so that no test asks the real ones as she talks, and Fish Audio's HTTP API a
+    `FakeFishAudio`, so that none asks it as she writes a letter."""
+    services.setdefault("weather_transport", FakeWeather(failing=True).transport())
+    services.setdefault("qweather_transport", FakeQWeather(failing=True).transport())
+    services.setdefault("fish_transport", httpx.MockTransport(FakeFishAudio().handle))
     clients = clients or FakeServiceClients()
     if llm is not None:
         clients.llm = llm
@@ -1163,13 +1199,43 @@ class KeywordReranker:
         return sorted(scored, key=lambda r: -r[1])[:top_n]
 
 
+class FakeEnzaAssets:
+    """Stands in for the game's own asset server: the files it is given, under the hash
+    of their path, JSON and atlases encrypted as it sends them, and the game's page, as
+    HTML, for a path it has no file for. Records the paths it sent. Set `down` to have it
+    unreachable, or `maintenance` to have it answer everything with the game's page."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+        self.sent: list[str] = []
+        self.down = False
+        self.maintenance = False
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        if self.down:
+            raise httpx.ConnectError("connection refused", request=request)
+        path = next((path for path in self.files if official_cdn.asset_url(path) == str(request.url)), None)
+        if path is None or self.maintenance:
+            return httpx.Response(200, text="<!DOCTYPE html><title>シャニマス</title>",
+                                  headers={"Content-Type": "text/html; charset=utf-8"})
+        self.sent.append(path)
+        content = self.files[path]
+        if path.endswith((".json", ".atlas")):  # gzipped up to a flush, never finished
+            gzipper = zlib.compressobj(wbits=zlib.MAX_WBITS | 16)
+            content = official_cdn.xor(gzipper.compress(content) + gzipper.flush(zlib.Z_SYNC_FLUSH))
+        return httpx.Response(200, content=content, headers={"ETag": f'W/"{hashlib.md5(content).hexdigest()}"'})
+
+
 class FakeShinyColorsDB:
     """Stands in for the ShinyColorsDB API, the viewer that mirrors the game's scripts and
     the idols' albums, answering as they do: idols and their cards, each card's episodes,
     albums, and scripts; scripts and albums with an ETag, 304 to a request for a copy that
     is still current and 404 for one it does not have. Records every request, and which
     scripts (and albums, as `album/NN`) it sent in full. Set `down`
-    to have it unreachable, or `down_after` to have it go down after that many requests."""
+    to have it unreachable, or `down_after` to have it go down after that many requests;
+    `viewer_down` to have only the viewer unreachable, `cdn_pages` to have the CDN answer
+    for a stand's file with an error page. Behind it, the game's asset server
+    (`official`), which has nothing unless given it."""
 
     def __init__(self) -> None:
         self.idols: dict[int, list[dict]] = {}
@@ -1180,6 +1246,9 @@ class FakeShinyColorsDB:
         self.sent: list[str] = []
         self.down = False
         self.down_after: int | None = None
+        self.viewer_down = False
+        self.cdn_pages = False
+        self.official = FakeEnzaAssets()
 
     def add_card(
         self, idol: int, uuid: str, name: str, type: str, episodes: Sequence[tuple[int, str]] = ()
@@ -1220,6 +1289,8 @@ class FakeShinyColorsDB:
         return Mirror(httpx.AsyncClient(transport=httpx.MockTransport(self._handle)), interval=0)
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.url.host == "shinycolors.enza.fun":
+            return self.official.handle(request)
         self.requests.append(request)
         if self.down or (self.down_after is not None and len(self.requests) > self.down_after):
             raise httpx.ConnectError("connection refused")
@@ -1234,10 +1305,14 @@ class FakeShinyColorsDB:
                 return httpx.Response(200, json={key: self.events[params["cardId"]]})
             return httpx.Response(404)
         if request.url.host == "cf-static.shinycolors.moe":
+            if not path.startswith("/albums/"):  # the stands, which are another fake's
+                return httpx.Response(200 if self.cdn_pages else 404, text="<html>Not Found</html>")
             idol = int(path.removeprefix("/albums/album/").removesuffix(".json"))
             album = self.albums.get(idol)
             body = None if album is None else json.dumps(album, ensure_ascii=False).encode()
             return self._send(request, f"album/{idol:02d}", body)
+        if self.viewer_down:
+            raise httpx.ConnectError("connection refused")
         script = path.removeprefix("/json/").removesuffix(".json")
         return self._send(request, script, self.scripts.get(script))
 
@@ -1838,6 +1913,190 @@ class FakeWorldSites:
             f'</picture>\n<p class="idol-group__logo--name">{name}</p>\n</div>\n'
             f'<ul class="idol-nav__unit">\n{nav}</ul>\n</main></body></html>'
         )
+
+
+class FakeWeather:
+    """Open-Meteo's forecast API, as `weather` fetches the weather over HTTP (`transport`).
+    Asked for hours (a moment's), each hour from `start_hour` to `end_hour` is answered with
+    `code` and `temperature` (the code None, as MSM leaves an hour it has not forecast).
+    Asked for days (her day's, `daily`), it answers yesterday, today and tomorrow where the
+    spot is (an hour ahead of UTC for each 15 degrees east), as of `clock` (without which it
+    fails): every hour `code` and `temperature`, but for those left of today, `later_code`
+    if set; each day's highest `high` and lowest `low` (3 degrees off the temperature by
+    default), yesterday's `yesterday_high` and `yesterday_low` if set; any of these set apart
+    for a spot in `spots`, by its latitude as asked. Either way, failing with 503 if
+    `failing`. Records the query of each request (`requests`)."""
+
+    def __init__(
+        self,
+        code: int | None = 0,
+        temperature: float = 18.4,
+        *,
+        failing: bool = False,
+        clock: "Callable[[], datetime] | None" = None,
+        later_code: int | None = None,
+        high: float | None = None,
+        low: float | None = None,
+        yesterday_high: float | None = None,
+        yesterday_low: float | None = None,
+        spots: "dict[str, dict[str, Any]] | None" = None,
+    ) -> None:
+        self.spots = spots or {}
+        self.code = code
+        self.temperature = temperature
+        self.failing = failing
+        self.clock = clock
+        self.later_code = later_code
+        self.high = high
+        self.low = low
+        self.yesterday_high = yesterday_high
+        self.yesterday_low = yesterday_low
+        self.requests: list[dict[str, str]] = []
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self._handle)
+
+    def days_asked(self) -> list[dict[str, str]]:
+        """The queries that asked for days."""
+        return [q for q in self.requests if "daily" in q]
+
+    def hours_asked(self) -> list[dict[str, str]]:
+        """The queries that asked for a moment's hours."""
+        return [q for q in self.requests if "daily" not in q]
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.open-meteo.com", request.url
+        query = dict(request.url.params)
+        self.requests.append(query)
+        if self.failing:
+            return httpx.Response(503, json={"error": True, "reason": "unavailable"})
+        if "daily" in query:
+            return self._days(query)
+        start, end = (
+            datetime.fromisoformat(query[k]).replace(tzinfo=UTC) for k in ("start_hour", "end_hour")
+        )
+        hours = int((end - start) / timedelta(hours=1)) + 1
+        return httpx.Response(200, json={"hourly": {
+            "time": [int((start + timedelta(hours=i)).timestamp()) for i in range(hours)],
+            "weather_code": [self.code] * hours,
+            "temperature_2m": [self.temperature] * hours,
+        }})
+
+    def _days(self, query: dict[str, str]) -> httpx.Response:
+        if self.clock is None:
+            return httpx.Response(503, json={"error": True, "reason": "no clock"})
+        apart = self.spots.get(query["latitude"], {})
+        code, temperature = apart.get("code", self.code), apart.get("temperature", self.temperature)
+        later_code = apart.get("later_code", self.later_code)
+        high, low = apart.get("high", self.high), apart.get("low", self.low)
+        yesterday_high = apart.get("yesterday_high", self.yesterday_high)
+        yesterday_low = apart.get("yesterday_low", self.yesterday_low)
+        offset = timedelta(hours=round(float(query["longitude"]) / 15))
+        now = self.clock()
+        local = (now + offset).replace(tzinfo=None)
+        today = datetime(local.year, local.month, local.day, tzinfo=UTC) - offset
+        days = [today - timedelta(days=1), today, today + timedelta(days=1)]
+        hours = [days[0] + timedelta(hours=i) for i in range(72)]
+        this_hour = now.replace(minute=0, second=0, microsecond=0)
+        codes = [
+            later_code if later_code is not None and this_hour < h < days[2] else code
+            for h in hours
+        ]
+        high = temperature + 3 if high is None else high
+        low = temperature - 3 if low is None else low
+        return httpx.Response(200, json={
+            "utc_offset_seconds": int(offset.total_seconds()),
+            "hourly": {
+                "time": [int(h.timestamp()) for h in hours],
+                "weather_code": codes,
+                "temperature_2m": [temperature] * len(hours),
+            },
+            "daily": {
+                "time": [int(d.timestamp()) for d in days],
+                "temperature_2m_max": [
+                    high if yesterday_high is None else yesterday_high, high, high
+                ],
+                "temperature_2m_min": [low if yesterday_low is None else yesterday_low, low, low],
+            },
+        })
+
+
+HARBIN = {
+    "name": "哈尔滨", "id": "101050101", "lat": "45.80298", "lon": "126.53505",
+    "adm2": "哈尔滨", "adm1": "黑龙江省", "country": "中国", "tz": "Asia/Shanghai",
+}
+"""Harbin, as QWeather finds it."""
+
+DONGCHENG = {
+    "name": "东城", "id": "101011600", "lat": "39.91755", "lon": "116.41876",
+    "adm2": "北京", "adm1": "北京市", "country": "中国", "tz": "Asia/Shanghai",
+}
+"""Dongcheng, in Beijing, as QWeather finds it."""
+
+SHINJUKU = {
+    "name": "新宿", "id": "B00176", "lat": "35.69384", "lon": "139.70355",
+    "adm2": "东京", "adm1": "东京都", "country": "日本", "tz": "Asia/Tokyo",
+}
+"""Shinjuku, in Tokyo, as QWeather finds it."""
+
+
+class FakeQWeather:
+    """QWeather (和风天气) on the account's own host, as `qweather` asks it over HTTP
+    (`transport`): looking a city up answers with `cities` (404 for none), the warnings at
+    a spot with `alerts`; failing as an account it does not know, 401, if `failing`.
+    Records each request's path, query and token (`requests`)."""
+
+    def __init__(
+        self,
+        cities: Sequence[dict] = (HARBIN,),
+        alerts: Sequence[dict] = (),
+        *,
+        failing: bool = False,
+    ) -> None:
+        self.cities = list(cities)
+        self.alerts = list(alerts)
+        self.failing = failing
+        self.requests: list[tuple[str, dict[str, str], str]] = []
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self._handle)
+
+    def lookups(self) -> list[dict[str, str]]:
+        return [q for path, q, _ in self.requests if path == "/geo/v2/city/lookup"]
+
+    def warnings_asked(self) -> list[str]:
+        return [path for path, _, _ in self.requests if path.startswith("/weatheralert/")]
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        auth = request.headers.get("authorization", "")
+        self.requests.append((request.url.path, dict(request.url.params), auth))
+        if self.failing:
+            return httpx.Response(401, json={"error": {
+                "status": 401, "type": "https://dev.qweather.com/docs/resource/error-code/#unauthorized",
+                "title": "Unauthorized", "detail": "Invalid token",
+            }})
+        if request.url.path == "/geo/v2/city/lookup":
+            if not self.cities:
+                return httpx.Response(200, json={"code": "404"})
+            return httpx.Response(200, json={
+                "code": "200", "location": self.cities,
+                "refer": {"sources": ["QWeather"], "license": ["QWeather Developers License"]},
+            })
+        if request.url.path.startswith("/weatheralert/v1/current/"):
+            return httpx.Response(200, json={
+                "metadata": {"tag": "t", "zeroResult": not self.alerts},
+                "alerts": self.alerts,
+            })
+        return httpx.Response(404, json={"error": {"status": 404, "title": "Not Found"}})
+
+
+def alert(headline: str, code: str = "alert") -> dict:
+    """A weather warning, as QWeather tells of one in force (or cancelled, `cancel`)."""
+    return {
+        "id": "1", "senderName": "哈尔滨市气象台", "messageType": {"code": code},
+        "eventType": {"name": "寒潮", "code": "1009"}, "severity": "minor",
+        "color": {"code": "blue"}, "headline": headline,
+    }
 
 
 class FakeCatalog:

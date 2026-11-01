@@ -1,25 +1,26 @@
 """Gifts (GLOSSARY.md「礼物」「抽奖」「重置卡」): each user's draw chances, what they have drawn
 and their reset cards, the one way into them for the gifts page and the admin console, but
-for drawing and giving, which count towards the daily tasks and the achievements and so are
-kept with them (`happenings.Happenings.draw`, `Happenings.give`).
+for drawing and giving, which count towards the achievements and so are kept with
+them (`happenings.Happenings.draw`, `Happenings.give`).
 
-Draw chances are given one a day (`affinity.DRAWS_PER_DAY`) as the day begins, at midnight
+Draw chances are given each day (`affinity.DRAWS_PER_DAY`) as the day begins, at midnight
 Beijing time wherever the user is (`affinity.day_of`), kept up to `affinity.MAX_DRAWS`.
 Nothing gives them on a schedule: whoever reads them first gives what the days since they
-were last given have brought. A user without any yet is given one that day, new or not.
+were last given have brought. A user without any yet is given that day's, new or not.
 
 Gifts are open where affinity is (`LiveConfig.affinity_on`): the deployment has the judge
 model and the switch「好感度和礼物」is on. Closed, what each user has is kept and read all
 the same, but no chances are given; and the days it was closed give none once it opens
-again, which gives one that day. So when it last opened is kept (`notice`), as the backend
-starts and as the switch changes. That is no one's; what each user has is theirs, deleted
-with them (`database.USER_DATA`).
+again, which gives that day's draw chances. So when it last opened is kept (`notice`), as
+the backend starts and as the switch changes. That is no one's; what each user has is
+theirs, deleted with them (`database.USER_DATA`).
 
-A user is rewarded for what they do (`reward`), as daily tasks are done and achievements'
-stages unlocked (`happenings`): each reward given once by its key, its draw chances over and
+A user is rewarded for what they do (`reward`), as achievements' stages are unlocked
+(`happenings`): each reward given once by its key, its draw chances over and
 above the most kept of those given each day, and its reset cards, never anything of her
 affinity. As the achievements launch, everyone is rewarded for what they did before, open
-or not (`reward_everyone`).
+or not (`reward_everyone`). The day's first visit to the bar done gives a draw chance too, but
+held to the most kept (`reward_draw`).
 
 An admin may give every user there is a reset card at once (`grant_reset_cards`), banned
 ones and admins too, but no one user anything on their own. Each grant is kept, when and
@@ -51,10 +52,12 @@ from eidolon.affinity import (
 )
 from eidolon.characters import Character
 from eidolon.clock import Clock
+from eidolon.cycles import Cycles
 from eidolon.data_access import Database
 from eidolon.gift_catalog import Gift
+from eidolon.producer import effective_timezone
 from eidolon.randomness import Random
-from eidolon.store import add_gift
+from eidolon.store import add_gift, read_profile
 
 _SCHEMA = """
 -- One row per user given any draw chances: how many they have, the day they were last given
@@ -197,7 +200,7 @@ class GiftState:
     """Each character's affinity with the user, for choosing whom to give to and telling
     whom a reset card would bring back: none while closed, as affinity shows nothing then."""
     rewarded_at: datetime | None
-    """When the user was last rewarded (`Gifts.reward`); None if never."""
+    """When the user was last rewarded (`Gifts.reward`, `Gifts.reward_draw`); None if never."""
 
     def shown(self) -> dict:
         """As the browser is told it."""
@@ -270,10 +273,11 @@ class Gifts:
         characters: dict[str, Character],
         catalog: dict[str, Gift],
         random: Random,
+        cycles: Cycles,
     ) -> None:
         """`is_open` tells whether gifts are open now (the live configuration's affinity
-        switch); draws take their numbers from `random`. Notices whether they have opened
-        since last noticed."""
+        switch); draws take their numbers from `random`; `cycles` tells whether she is in her
+        days, for a warm gift. Notices whether they have opened since last noticed."""
         self._db = db
         self._clock = clock
         self._is_open = is_open
@@ -281,6 +285,7 @@ class Gifts:
         self._characters = characters
         self._catalog = catalog
         self._random = random
+        self._cycles = cycles
         db.prepare(_open)
         db.prepare(self._notice, is_open())
 
@@ -349,13 +354,28 @@ class Gifts:
         if gift_id not in self._catalog:
             raise NoneLeft()
 
+    async def warms(
+        self, user_id: str, gift_id: str, character_id: str, device_timezone: str | None
+    ) -> bool:
+        """Whether the gift, given the character now, is warm and she in her period or the
+        days before it (GLOSSARY.md「周期」), on the producer's day, the user's device in
+        `device_timezone`: before it is given (`give`), as where she is is read apart. The
+        gift and the character are to be there (`refuse_unknown`)."""
+        if not self._catalog[gift_id].warm:
+            return False
+        timezone = effective_timezone(await self._db.read(read_profile, user_id), device_timezone)
+        her_days = await self._cycles.her_days(user_id, character_id)
+        return her_days(self._clock(), timezone) is not None
+
     def give(
-        self, db: sqlite3.Connection, user_id: str, gift_id: str, character_id: str
+        self, db: sqlite3.Connection, user_id: str, gift_id: str, character_id: str,
+        warmed: bool,
     ) -> Given:
         """Give the character one of the gift, through `db`, in the transaction what giving
         it counts towards is kept in (`Happenings.give`): taken from the backpack, raising
-        her affinity, and recorded where `store.add_gift` places it, all or none of it, so
-        two giving the last one at once give it once. Gifts are to be open
+        her affinity, by more if it `warmed` her (`warms`), and recorded where
+        `store.add_gift` places it, all or none of it, so two giving the last one at once
+        give it once; whether it warmed her is kept nowhere. Gifts are to be open
         (`refuse_unless_open`), and the gift and the character to be there
         (`refuse_unknown`). Raises NoneLeft if the user has none of it."""
         taken = db.execute(
@@ -367,7 +387,7 @@ class Gifts:
             raise NoneLeft()
         liked = gift_id in self._characters[character_id].liked_gifts
         change, affinity = self._affinities.receive_gift(
-            db, user_id, character_id, self._catalog[gift_id].rarity, liked
+            db, user_id, character_id, self._catalog[gift_id].rarity, liked, warmed
         )
         conversation = add_gift(db, user_id, character_id, gift_id, liked, change)
         return Given(conversation.id, change, affinity, taken[0])
@@ -390,8 +410,8 @@ class Gifts:
     ) -> tuple[list[Reward], datetime]:
         """Give the user each reward `due` says is due that they have not been given yet by
         its key, having been given the draw chances due today; one with no draw chances yet
-        is given the new user's one first. Gifts are to be open, as the one who rewards
-        found them on the event loop; they are noticed open first. Through `db`, in the
+        is given the new user's draw chances first. Gifts are to be open, as the one who
+        rewards found them on the event loop; they are noticed open first. Through `db`, in the
         transaction what they are rewarded for is kept in, so that it is rewarded with it or
         not at all, and two rewarded at once for the same are rewarded once; `due` is
         called with the connection and now, the same now the draw chances are given by. The
@@ -403,6 +423,20 @@ class Gifts:
         given = [r for r in rewards if _credit(db, user_id, r, now)]
         return given, now
 
+    def reward_draw(self, db: sqlite3.Connection, user_id: str, key: str) -> bool:
+        """Give the user a draw chance for something they did, once by its `key`, having been
+        given the draw chances due today, unless that leaves them more than the most kept:
+        unlike `reward`'s, held to it, as the day's are. Recorded as a reward only if given, so
+        that only then is the user told of one. Gifts are to be open, as for `reward`; through
+        `db`, in the transaction what they are rewarded for is kept in. Whether given."""
+        self._notice(db, True)
+        now = self._clock()
+        _give(db, user_id, day_of(now))
+        (draws,) = db.execute(
+            "SELECT draws FROM gift_balances WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return draws < MAX_DRAWS and _credit(db, user_id, Reward(key, 1), now)
+
     def reward_everyone(
         self,
         db: sqlite3.Connection,
@@ -410,7 +444,7 @@ class Gifts:
     ) -> list[tuple[str, Reward]]:
         """Give each user each reward `due` says is due them that they have not been given
         yet by its key, open or not, as the achievements launch, through `db`: none of the
-        draw chances due today, but the new user's one first to one with none yet. `due` is
+        draw chances due today, but the new user's draw chances to one with none yet. `due` is
         called as `reward`'s is. The rewards given, and to whom."""
         given = []
         now = self._clock()
@@ -426,8 +460,8 @@ class Gifts:
     async def grant_reset_cards(self) -> Grant:
         """Give every user there is now a reset card, banned ones and admins too, all at
         once, so that whoever signs up meanwhile gets none; one who has had no draw chances
-        yet is given the new user's one too, that day. Raises GiftsClosed if gifts are not
-        open."""
+        yet is given the new user's draw chances too, that day. Raises GiftsClosed if gifts
+        are not open."""
         await self.refuse_unless_open()
         return await self._db.write(_grant_reset_cards, self._clock())
 
@@ -606,7 +640,7 @@ def _give(db: sqlite3.Connection, user_id: str, today: date) -> None:
 
 
 def _start(db: sqlite3.Connection, user_id: str, today: date, reset_cards: int = 0) -> None:
-    """Give a user who has had no draw chances yet the new user's one, `today`, and
+    """Give a user who has had no draw chances yet the new user's draw chances, `today`, and
     `reset_cards`, through `db`."""
     db.execute(
         "INSERT INTO gift_balances (user_id, draws, given_on, reset_cards) VALUES (?, ?, ?, ?)",

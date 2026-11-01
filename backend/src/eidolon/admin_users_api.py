@@ -2,8 +2,9 @@
 banning or unbanning them (ADR-0013).
 
 What an admin sees of a user is who they are and how they use the deployment: their
-sign-in methods (email included), when they joined and were last active, whether they
-are banned and why, and whether they are an admin. Never what they said, what was
+sign-in methods (email included), when they joined and were last active, through which
+invite link they signed up, if one, whether they are banned and why, and whether they are an
+admin. Never what they said, what was
 remembered of them or their producer profile, nor whether they brought their own keys,
 which their browsers keep (ADR-0017): only how much of their use was on them.
 
@@ -13,8 +14,9 @@ polling (`call.USER_CHECK_INTERVAL`), and they cannot sign in until unbanned. No
 can be banned here, oneself included, so that no admin locks the others, or themselves,
 out; the deployer can still on the command line.
 
-An admin may also set a user's own limits on turns and calls an hour, each apart, or take
-them off; the length of a call is the same for everyone.
+An admin may also set a user's own limits on turns, calls, photos, visits to the bar and
+read-alouds an hour, each apart, or take them off; the length of a call is the same for
+everyone.
 
 How much a user has used the deployment lately is from the activity records (not the
 `usage` table, the limit's sliding hour): the list shows how many turns and calls each
@@ -69,15 +71,20 @@ class LimitsInput(BaseModel):
     turns_per_hour: Limit = None
     calls_per_hour: Limit = None
     photos_per_hour: Limit = None
+    visits_per_hour: Limit = None
+    read_alouds_per_hour: Limit = None
     note: str | None = Field(None, max_length=500)
     """Why, for the admins only."""
 
     @model_validator(mode="after")
     def _any(self) -> "LimitsInput":
-        if self.turns_per_hour is None and self.calls_per_hour is None and (
-            self.photos_per_hour is None
+        if all(
+            limit is None for limit in (
+                self.turns_per_hour, self.calls_per_hour, self.photos_per_hour,
+                self.visits_per_hour, self.read_alouds_per_hour,
+            )
         ):
-            raise ValueError("至少要单独设定回合数、通话次数或照片数中的一项")
+            raise ValueError("至少要单独设定回合数、通话次数、照片数、光顾次数或朗读次数中的一项")
         return self
 
 
@@ -140,9 +147,11 @@ def add_admin_user_routes(app: FastAPI, backend: Backend) -> None:
         [shown] = await described([user])
         now = clock()
         records = await activity.of_user(user_id, now - max(USAGE_RANGES.values()))
+        invite = await backend.invites.of_user(user_id)
         return shown | {
             "banned_at": user.banned_at,
             "ban_note": user.ban_note,
+            "invite": None if invite is None else {"id": invite.id, "note": invite.note},
             "usage": {
                 name: recent_usage(records, now - span) for name, span in USAGE_RANGES.items()
             },
@@ -199,7 +208,8 @@ def add_admin_user_routes(app: FastAPI, backend: Backend) -> None:
         await details(user_id)
         await limiter.set_user_limits(user_id, UserLimits(
             body.turns_per_hour, body.calls_per_hour, (body.note or "").strip() or None,
-            photos_per_hour=body.photos_per_hour,
+            photos_per_hour=body.photos_per_hour, visits_per_hour=body.visits_per_hour,
+            read_alouds_per_hour=body.read_alouds_per_hour,
         ))
         return await details(user_id)
 

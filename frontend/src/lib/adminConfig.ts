@@ -30,8 +30,15 @@ export type ItemName =
   | "limits"
   | "affinity"
   | "reach_outs"
+  | "letters"
+  | "moments"
+  | "qweather"
+  | "schedule"
+  | "cycles"
+  | "bar"
   | "proxy"
-  | "service_status";
+  | "service_status"
+  | "registration";
 
 /** A model's extra request body is a JSON object; every other value is plain. */
 type Value = string | number | boolean | null | JsonObject;
@@ -72,20 +79,34 @@ export function isAvailable(item: ConfigItem | UnavailableItem): item is ConfigI
 }
 
 /** The page's tabs, in order. */
-export const CONFIG_TABS = ["models", "voice", "image", "network", "status", "limits", "sponsor", "prices", "read_only"] as const;
+export const CONFIG_TABS = [
+  "models",
+  "voice",
+  "image",
+  "weather",
+  "network",
+  "status",
+  "limits",
+  "registration",
+  "sponsor",
+  "prices",
+  "read_only",
+] as const;
 
 export type ConfigTab = (typeof CONFIG_TABS)[number];
 
 /** The items under each tab, in the order it shows them. Every item is under exactly one tab;
- * sponsoring, the prices and the read-only items are not items, so their tabs list none and the
- * page puts their cards in itself. */
+ * sponsoring, the invite links, the prices and the read-only items are not items, so their tabs
+ * list none, or only the item beside them, and the page puts their cards in itself. */
 export const TAB_ITEMS: Record<ConfigTab, ItemName[]> = {
   models: ["chat_llm", "memory_llm", "judge", "judge_thresholds", "rerank"],
   voice: ["tts", "stt"],
   image: ["image"],
+  weather: ["qweather"],
   network: ["proxy"],
   status: ["service_status"],
-  limits: ["limits", "affinity", "reach_outs"],
+  limits: ["limits", "affinity", "reach_outs", "letters", "moments", "schedule", "cycles", "bar"],
+  registration: ["registration"],
   sponsor: [],
   prices: [],
   read_only: [],
@@ -191,6 +212,12 @@ export function modelChoice(options: readonly string[], model: string): string {
   return options.includes(model) ? model : CUSTOM_MODEL;
 }
 
+/** Who may sign up (GLOSSARY.md「注册方式」): anyone, or only those who bring an invite link. */
+export const REGISTRATIONS = ["open", "invite"] as const;
+
+/** Where a moment's place links to on the map (GLOSSARY.md「地点」): OpenStreetMap, Google Maps or Amap. */
+export const MAP_SITES = ["osm", "google", "amap"] as const;
+
 /** How many of the latest minutes the service status may go by, as the backend takes them. */
 export const STATUS_WINDOWS = ["10", "30", "60"] as const;
 
@@ -199,6 +226,8 @@ export const LIMIT_FIELDS = [
   "turns_per_hour",
   "calls_per_hour",
   "photos_per_hour",
+  "visits_per_hour",
+  "read_alouds_per_hour",
   "call_minutes",
   "turns_per_call",
   "concurrent_calls",
@@ -333,6 +362,60 @@ export const ITEM_SPECS: Record<ItemName, ItemSpec> = {
     ],
     tried: false,
   },
+  // 信（GLOSSARY.md「信」）：只有一个总开关。不试调。
+  letters: {
+    rows: ["enabled"],
+    secrets: [],
+    form: [{ name: "enabled", kind: "switch" }],
+    tried: false,
+  },
+  // 朋友圈（GLOSSARY.md「朋友圈」）：总开关，每位用户每天合计最多几条，地名点开跳哪家地图，每位用户每天她最多回几条评论。不试调。
+  moments: {
+    rows: ["enabled", "per_day", "map", "replies_per_day"],
+    secrets: [],
+    form: [
+      { name: "enabled", kind: "switch" },
+      { name: "per_day", kind: "positive" },
+      { name: "map", kind: "select", options: MAP_SITES },
+      { name: "replies_per_day", kind: "positive" },
+    ],
+    tried: false,
+  },
+  // 和风天气（GLOSSARY.md「制作人档案」）：找制作人的城市、查那边的预警用的账号，JWT 认证的五样都要填。
+  // 保存前按坐标反查一次北京。
+  qweather: {
+    rows: ["host", "developer_id", "project_id", "key_id", "private_key"],
+    secrets: ["private_key"],
+    form: [
+      { name: "host", kind: "text" },
+      { name: "developer_id", kind: "text" },
+      { name: "project_id", kind: "text" },
+      { name: "key_id", kind: "text" },
+      { name: "private_key", kind: "secret" },
+    ],
+    tried: true,
+  },
+  // 日程（GLOSSARY.md「日程」）：只有一个开关。不试调。
+  schedule: {
+    rows: ["enabled"],
+    secrets: [],
+    form: [{ name: "enabled", kind: "switch" }],
+    tried: false,
+  },
+  // 周期（GLOSSARY.md「周期」）：只有一个开关。不试调。
+  cycles: {
+    rows: ["enabled"],
+    secrets: [],
+    form: [{ name: "enabled", kind: "switch" }],
+    tried: false,
+  },
+  // 酒吧（GLOSSARY.md「酒吧」）：只有一个开关。不试调。
+  bar: {
+    rows: ["enabled"],
+    secrets: [],
+    form: [{ name: "enabled", kind: "switch" }],
+    tried: false,
+  },
   // 网络代理（GLOSSARY.md「网络代理」）：总开关、地址、密码，每项服务一个开关。保存前把换了路线的服务连一遍。
   proxy: {
     rows: ["enabled", "url", "password", ...PROXIED_SERVICES],
@@ -353,6 +436,13 @@ export const ITEM_SPECS: Record<ItemName, ItemSpec> = {
       { name: "window_minutes", kind: "minutes", options: STATUS_WINDOWS },
       ...STATUS_SERVICES.map((name): FieldSpec => ({ name, kind: "switch" })),
     ],
+    tried: false,
+  },
+  // 注册方式（GLOSSARY.md「注册方式」）：谁都能注册，或者只让受邀的人注册。不试调。
+  registration: {
+    rows: ["mode"],
+    secrets: [],
+    form: [{ name: "mode", kind: "select", options: REGISTRATIONS }],
     tried: false,
   },
 };

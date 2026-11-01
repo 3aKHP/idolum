@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator, Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -18,11 +19,17 @@ from eidolon.__main__ import main
 from eidolon.activity import ActivityLog
 from eidolon.app import create_app
 from eidolon.assembly import Backend
+from eidolon.bar_lines import BAR_LINES_FILE
+from eidolon.bar_visits import BAR_VISITS_FILE
 from eidolon.clock import Clock
 from eidolon.config import LLMSettings, Settings
 from eidolon.data_access import Database
+from eidolon.drink_catalog import DRINKS_FILE
 from eidolon.gift_catalog import GIFTS_FILE
+from eidolon.letter_music import LETTER_MUSIC_FILE
 from eidolon.identity import Identity
+from eidolon.job_list import JOBS_FILE
+from eidolon.place_pool import PLACES_FILE
 from eidolon.sessions import SESSION_COOKIE
 from eidolon.store import Store
 from tests.browser import Browser, open_browser
@@ -31,6 +38,7 @@ from tests.fakes import (
     DEPLOYER_SONIOX_KEY,
     START,
     FakeCatalog,
+    FakeWeather,
     FakeClock,
     FakeDashScope,
     FakeIdentityProvider,
@@ -126,12 +134,30 @@ MANO_PHOTO = ("sakuragi mano", "brown hair, medium hair, brown eyes")
 AVATAR = b"\x89PNG\r\n\x1a\n fake avatar"
 SCSP_AVATAR = b"\xff\xd8\xff fake SCSP avatar"
 BACKGROUND = b"\xff\xd8\xff fake background"
+SIGNATURE = b"RIFF\x00\x00\x00\x00WEBP fake signature"
 REPO_GIFTS = Path(__file__).parents[2] / "characters" / GIFTS_FILE
+REPO_LETTER_MUSIC = Path(__file__).parents[2] / "characters" / LETTER_MUSIC_FILE
+REPO_JOBS = Path(__file__).parents[2] / "characters" / JOBS_FILE
+REPO_DRINKS = Path(__file__).parents[2] / "characters" / DRINKS_FILE
+REPO_BAR_VISITS = Path(__file__).parents[2] / "characters" / BAR_VISITS_FILE
+REPO_BAR_LINES = Path(__file__).parents[2] / "characters" / BAR_LINES_FILE
+REPO_PLACES = Path(__file__).parents[2] / "characters" / PLACES_FILE
+BAR_TASTE: dict[str, object] = {
+    "bar_flavors": ["sweet"], "bar_favorites": ["sugar-rush"], "bar_tolerance": "strong",
+}
+"""Her bar tastes, the fields required and no more, as `CharacterConfig.add` writes them
+unless a test gives others: holding her drink well, so that no chance is taken on her
+wanting one without alcohol."""
 
 
 class CharacterConfig:
     """Writes a character configuration directory, the way an administrator would, with the
-    repository's gift catalog beside it unless a test writes its own (`gifts.toml`)."""
+    repository's gift catalog, job list, drink catalog, bar reasons and topics, bar lines,
+    place pool and letters' music list beside it unless a test writes its own (`gifts.toml`,
+    `jobs.toml`, `drinks.toml`, `bar_visits.toml`, `bar_lines.toml`, `places.toml`,
+    `letter_music.toml`). The reasons and
+    topics are written for every character, none left out (`not_for`), and the places for
+    no one (`idols`), as the repository's name characters a test may not have."""
 
     def __init__(self, directory: Path) -> None:
         self.directory = directory
@@ -149,7 +175,10 @@ class CharacterConfig:
         avatar: bytes | None = None,
         scsp_avatar: bytes | None = None,
         color: str | None = "#ffbad6",
+        birthday: str | None = "07-07",
+        age: int | str | None = 20,
         background: bytes | None = None,
+        signature: bytes | None = None,
         speakers: list[str] | None = None,
         facts: str | None = None,
         idol_id: int | None = None,
@@ -159,12 +188,19 @@ class CharacterConfig:
         other_names: tuple[str, str, str] | None = None,
         liked_gifts: tuple[str, ...] | None = ("cake",),
         photo: tuple[str, str] | None = None,
+        bar: dict[str, object] | None = BAR_TASTE,
+        place_likes: tuple[str, ...] | None = None,
+        short_name: str | None = None,
     ) -> "CharacterConfig":
         """`greeting` is her greeting in Japanese, delivery cues and all, and its subtitle;
         `call_opener` her call opener, likewise; `other_names` her `name_zh`, `name_kana`
         and `name_romaji`; `liked_gifts` her liked gifts (None leaves them out), cake by
         default as every catalog the tests write has it; `photo` her `photo_tag` and
-        `photo_appearance`."""
+        `photo_appearance`; `bar` her bar tastes, field by field (None leaves them all out);
+        `place_likes` the kinds of place she likes (None leaves them out); `short_name` her
+        short name; `birthday` her `"MM-DD"`, a day on which tests' clocks fall on no one's
+        birthday unless they set one (None leaves it out); `age` her age, as
+        TOML writes it, or None to leave it out."""
         entry = f'[[characters]]\nid = "{id}"\nname = "{name}"\nintro = "{intro}"\n'
         entry += f'voice_id = "{voice_id}"\nsheet = "sheets/{id}.md"\n'
         if sheet is not None:
@@ -177,9 +213,16 @@ class CharacterConfig:
             entry += f'scsp_avatar = "avatars-scsp/{id}.jpg"\n'
         if color is not None:
             entry += f'color = "{color}"\n'
+        if birthday is not None:
+            entry += f'birthday = "{birthday}"\n'
+        if age is not None:
+            entry += f"age = {age}\n"
         if background is not None:
             self.write(f"backgrounds/{id}.jpg", background)
             entry += f'background = "backgrounds/{id}.jpg"\n'
+        if signature is not None:
+            self.write(f"signatures/{id}.webp", signature)
+            entry += f'signature = "signatures/{id}.webp"\n'
         if facts is not None:
             self.write(f"facts/{id}.md", facts)
             entry += f'facts = "facts/{id}.md"\n'
@@ -197,6 +240,8 @@ class CharacterConfig:
             text, subtitle = call_opener
             entry += f"call_opener = {json.dumps(text, ensure_ascii=False)}\n"
             entry += f"call_opener_subtitle = {json.dumps(subtitle, ensure_ascii=False)}\n"
+        if short_name is not None:
+            entry += f"short_name = {json.dumps(short_name, ensure_ascii=False)}\n"
         if other_names is not None:
             for field, value in zip(("name_zh", "name_kana", "name_romaji"), other_names):
                 entry += f"{field} = {json.dumps(value, ensure_ascii=False)}\n"
@@ -205,11 +250,31 @@ class CharacterConfig:
         if photo is not None:
             entry += f"photo_tag = {json.dumps(photo[0])}\n"
             entry += f"photo_appearance = {json.dumps(photo[1])}\n"
+        for field, value in (bar or {}).items():
+            entry += f"{field} = {json.dumps(value)}\n"
+        if place_likes is not None:
+            entry += f"place_likes = {json.dumps(list(place_likes))}\n"
         self._entries.append(entry)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.path.write_text("\n".join(self._entries), encoding="utf-8")
         if not (gifts := self.directory / GIFTS_FILE).exists():
             gifts.write_bytes(REPO_GIFTS.read_bytes())
+        if not (jobs := self.directory / JOBS_FILE).exists():
+            jobs.write_bytes(REPO_JOBS.read_bytes())
+        if not (drinks := self.directory / DRINKS_FILE).exists():
+            drinks.write_bytes(REPO_DRINKS.read_bytes())
+        if not (visits := self.directory / BAR_VISITS_FILE).exists():
+            repository = REPO_BAR_VISITS.read_text(encoding="utf-8")
+            everyones = re.sub(r"^not_for = \[[^]]*\]\n", "", repository, flags=re.M)
+            visits.write_text(everyones, encoding="utf-8")
+        if not (bar_lines := self.directory / BAR_LINES_FILE).exists():
+            bar_lines.write_bytes(REPO_BAR_LINES.read_bytes())
+        if not (places := self.directory / PLACES_FILE).exists():
+            repository = REPO_PLACES.read_text(encoding="utf-8")
+            anyones = re.sub(r"^idols = \[[^]]*\]\n", "", repository, flags=re.M)
+            places.write_text(anyones, encoding="utf-8")
+        if not (music := self.directory / LETTER_MUSIC_FILE).exists():
+            music.write_bytes(REPO_LETTER_MUSIC.read_bytes())
         return self
 
     def write(self, relative: str, content: str | bytes) -> None:
@@ -223,18 +288,21 @@ class CharacterConfig:
 
 @pytest.fixture
 def characters(tmp_path: Path) -> CharacterConfig:
-    """Mano (with both avatars, a background, a stand and her photo tags) and Kogane (with none
-    of them)."""
+    """Mano (with both avatars, a background, a signature, a stand and her photo tags) and
+    Kogane (with none of them)."""
     return (
         CharacterConfig(tmp_path / "characters")
         .add(
             "mano", "櫻木真乃", MANO_SHEET, intro="illumination STARS 的中心", avatar=AVATAR,
-            scsp_avatar=SCSP_AVATAR, color="#ffbad6", background=BACKGROUND, speakers=["真乃"],
+            scsp_avatar=SCSP_AVATAR, color="#ffbad6", background=BACKGROUND, signature=SIGNATURE,
+            speakers=["真乃"],
             voice_id="mano-voice", idol_id=1, default_outfit="stand/1030010010", photo=MANO_PHOTO,
+            birthday="04-25", age=16,
         )
         .add(
             "kogane", "月岡恋鐘", KOGANE_SHEET, intro="L'Antica 的偶像", color="#f84cad",
-            speakers=["恋鐘"], voice_id="kogane-voice",
+            speakers=["恋鐘"], voice_id="kogane-voice", birthday="02-25",
+            age=19,
         )
     )
 
@@ -257,6 +325,9 @@ def settings(tmp_path: Path, characters: CharacterConfig) -> Settings:
         secret_key="test-secret-key",
         soniox_api_key=DEPLOYER_SONIOX_KEY,
         fish_audio_api_key=DEPLOYER_FISH_KEY,
+        # Off, so that no test's clock lands in her period or the days before by chance;
+        # those of her cycle turn it on (`test_her_days`).
+        cycles=False,
     )
 
 
@@ -315,12 +386,13 @@ async def sign_in_with(
     identity: Identity,
     *,
     link: bool = False,
+    invite: str | None = None,
 ) -> httpx.Response:
-    """Go through signing in at `provider` as `identity`, or with `link`, linking it to the
-    signed-in user; the response to the callback."""
-    start = await client.get(
-        f"/api/auth/{provider.name}/start", params={"link": "1"} if link else None
-    )
+    """Go through signing in at `provider` as `identity`, through the invite link with the
+    code `invite` if given, or with `link`, linking it to the signed-in user; the response
+    to the callback."""
+    params = {"link": "1"} if link else {"invite": invite} if invite is not None else None
+    start = await client.get(f"/api/auth/{provider.name}/start", params=params)
     assert start.status_code == 302, start.text
     [state] = parse_qs(urlsplit(start.headers["location"]).query)["state"]
     code = provider.will_identify(identity)
@@ -396,9 +468,9 @@ async def make_client(
     `FakeServiceClients` that make them (`clients`), or an outside service to use instead
     of the one the settings describe (see `fakes.build_faked`); speech, the identity
     providers (the `github` and `google` fixtures), the LLM services users bring their
-    own keys to (`own_llm`) and the price catalogs online (an empty `FakeCatalog`) are
-    fakes by default, and `voice_configured=False` leaves the deployer without speech
-    keys."""
+    own keys to (`own_llm`), the price catalogs online (an empty `FakeCatalog`) and Tokyo's
+    weather (a `FakeWeather` failing, so that moments go without it) are fakes by default,
+    and `voice_configured=False` leaves the deployer without speech keys."""
     backends: list[Backend] = []
     clients: list[httpx.AsyncClient] = []
 
@@ -414,6 +486,7 @@ async def make_client(
         services.setdefault("own_llm_service", own_llm)
         services.setdefault("speech", speech)
         services.setdefault("catalog_transport", FakeCatalog().transport())
+        services.setdefault("weather_transport", FakeWeather(failing=True).transport())
         if not voice_configured:
             settings = replace(settings, soniox_api_key=None, fish_audio_api_key=None)
         backend = build_faked(settings, llm, **services)

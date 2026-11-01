@@ -22,7 +22,7 @@ import zipfile
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal, get_args
 
@@ -38,9 +38,14 @@ from pydantic import (
 )
 
 from eidolon.affinity import Change, Tier, next_day
+from eidolon import cycle_records
 from eidolon.characters import Character
 from eidolon.data_access import Database
 from eidolon.gift_catalog import Gift
+from eidolon.letter_prompt import Occasion, Paragraph, Written
+from eidolon.letters import Carried as CarriedLetter
+from eidolon.letters import add_carried as add_carried_letters
+from eidolon.letters import read_carried as read_carried_letters
 from eidolon.memory import (
     MAX_MEMORY_LENGTH,
     CarriedMemory,
@@ -50,8 +55,10 @@ from eidolon.memory import (
     add_carried,
 )
 from eidolon.producer import (
+    MAX_CITY_PART_LENGTH,
     MAX_FORM_OF_ADDRESS_LENGTH,
     Birthday,
+    City,
     Gender,
     ProducerProfile,
     is_day_of_the_year,
@@ -74,14 +81,28 @@ from eidolon.store import (
     write_profile,
 )
 
-FORMAT = 2
+FORMAT = 5
 """The newest format this version reads, and the one it exports. Changing the format adds
-one to it, and keeps reading the older ones: 2 added her reach-outs (`reach_outs`)."""
+one to it, and keeps reading the older ones: 2 added her reach-outs (`reach_outs`), 3 her
+being unwell among the events (`unwell`) and the periods the user wrote down (`cycles`), 4
+the producer's city in the profile (`city`), 5 the letters she wrote (`letters`)."""
 
 REACH_OUTS_SINCE = 2
 """The format whose conversations first held her reach-outs: before it, none may."""
 
-Category = Literal["conversations", "photos", "memories", "profile"]
+UNWELL_SINCE = 3
+"""The format whose conversations first held her being unwell: before it, none may."""
+
+CYCLES_SINCE = 3
+"""The format whose packages first held the periods the user wrote down: before it, none may."""
+
+CITY_SINCE = 4
+"""The format whose profiles first held the producer's city: before it, none may."""
+
+LETTERS_SINCE = 5
+"""The format whose packages first held the letters she wrote: before it, none may."""
+
+Category = Literal["conversations", "photos", "memories", "profile", "cycles", "letters"]
 CATEGORIES: tuple[Category, ...] = get_args(Category)
 """What a package may hold, in the order a manifest lists them. Photos go with the
 conversations they were sent in, never without them."""
@@ -163,8 +184,32 @@ def _written(at: datetime) -> str:
 Time = Annotated[str, AfterValidator(_stored_time)]
 
 
+def _day(value: str) -> str:
+    """A calendar day, as the database writes it: ISO 8601, nothing else."""
+    if date.fromisoformat(value).isoformat() != value:
+        raise ValueError("not a day as written")
+    return value
+
+
+Day = Annotated[str, AfterValidator(_day)]
+
+
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+
+CityPart = Annotated[str, Field(max_length=MAX_CITY_PART_LENGTH)]
+
+
+class PackagedCity(_Strict):
+    """The producer's city, as QWeather found it (`producer.City`)."""
+
+    name: Annotated[str, Field(min_length=1, max_length=MAX_CITY_PART_LENGTH)]
+    adm2: CityPart
+    adm1: CityPart
+    country: CityPart
+    latitude: Annotated[float, Field(ge=-90, le=90)]
+    longitude: Annotated[float, Field(ge=-180, le=180)]
 
 
 class PackagedProfile(_Strict):
@@ -175,6 +220,8 @@ class PackagedProfile(_Strict):
     (`producer.effective_timezone`)."""
     birthday_month: int | None
     birthday_day: int | None
+    city: PackagedCity | None = None
+    """Since format 4 (`CITY_SINCE`)."""
 
     @model_validator(mode="after")
     def _birthday(self) -> "PackagedProfile":
@@ -194,6 +241,7 @@ class PackagedProfile(_Strict):
             timezone=profile.timezone,
             birthday_month=birthday and birthday.month,
             birthday_day=birthday and birthday.day,
+            city=PackagedCity(**asdict(profile.city)) if profile.city else None,
         )
 
     def profile(self) -> ProducerProfile:
@@ -202,8 +250,9 @@ class PackagedProfile(_Strict):
             if self.birthday_month is not None and self.birthday_day is not None
             else None
         )
+        city = City(**self.city.model_dump()) if self.city else None
         return ProducerProfile(
-            self.form_of_address or None, self.gender, self.timezone or None, birthday
+            self.form_of_address or None, self.gender, self.timezone or None, birthday, city
         )
 
 
@@ -345,11 +394,18 @@ class PackagedEvent(_Strict):
     gift_id: Annotated[str, Field(min_length=1, max_length=100)] | None
     """Which gift, for a gift's alone."""
     liked: bool
+    first_day: Day | None = None
+    """For her being unwell alone: the first day of her period."""
+    days_ago: Annotated[int, Field(ge=0)] | None = None
+    """For her being unwell alone: how many days before the day it was recorded on."""
 
     @model_validator(mode="after")
     def _gift_for_a_gift(self) -> "PackagedEvent":
         if (self.kind == "gift") != (self.gift_id is not None):
             raise ValueError("a gift without which, or which gift for no gift")
+        unwell = self.kind == "unwell"
+        if unwell != (self.first_day is not None) or unwell != (self.days_ago is not None):
+            raise ValueError("being unwell without since when, or since when for no such")
         return self
 
     @classmethod
@@ -357,12 +413,13 @@ class PackagedEvent(_Strict):
         return cls(
             kind=event.kind, created_at=event.created_at,
             affinity=PackagedChange.of(event.affinity), gift_id=event.gift_id, liked=event.liked,
+            first_day=event.first_day, days_ago=event.days_ago,
         )
 
     def kept(self) -> KeptEvent:
         return KeptEvent(
             self.kind, self.created_at, self.affinity and self.affinity.change(), self.gift_id,
-            self.liked,
+            self.liked, self.first_day, self.days_ago,
         )
 
 
@@ -483,12 +540,83 @@ class PackagedMemory(_Strict):
         )
 
 
+class PackagedCycle(_Strict):
+    """A period the user wrote down of a character (GLOSSARY.md「周期」): whose, from when, how
+    many days; days out of bounds are skipped as it is imported, not refused."""
+
+    character_id: Annotated[str, Field(min_length=1, max_length=100)]
+    first_day: Day
+    days: StrictInt
+
+    @classmethod
+    def of(cls, record: cycle_records.Carried) -> "PackagedCycle":
+        return cls(
+            character_id=record.character_id, first_day=record.first_day.isoformat(),
+            days=record.days,
+        )
+
+    def carried(self) -> cycle_records.Carried:
+        return cycle_records.Carried(
+            self.character_id, date.fromisoformat(self.first_day), self.days
+        )
+
+
+class PackagedParagraph(_Strict):
+    ja: str
+    zh: str
+
+
+class PackagedLetter(_Strict):
+    """A letter she wrote the producer (GLOSSARY.md「信」), as she wrote it, delivery cues and
+    all; not her voice."""
+
+    character_id: Annotated[str, Field(min_length=1, max_length=100)]
+    character_name: Annotated[str, Field(max_length=100)] | None
+    """Her name where it was exported, for whoever reads the package; None if she was no
+    longer there."""
+    occasions: Annotated[list[Occasion], Field(min_length=1)]
+    day: Day
+    """The day she wrote it, where the producer was."""
+    written_at: Time
+    salutation: str
+    paragraphs: Annotated[list[PackagedParagraph], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def _each_occasion_once(self) -> "PackagedLetter":
+        if len(set(self.occasions)) != len(self.occasions):
+            raise ValueError("an occasion twice")
+        return self
+
+    @classmethod
+    def of(cls, letter: CarriedLetter, name: str | None) -> "PackagedLetter":
+        return cls(
+            character_id=letter.character_id,
+            character_name=name,
+            occasions=list(letter.occasions),
+            day=letter.day.isoformat(),
+            written_at=_written(letter.written_at),
+            salutation=letter.written.salutation,
+            paragraphs=[
+                PackagedParagraph(ja=p.ja, zh=p.zh) for p in letter.written.paragraphs
+            ],
+        )
+
+    def carried(self) -> CarriedLetter:
+        return CarriedLetter(
+            self.character_id, tuple(self.occasions), date.fromisoformat(self.day),
+            datetime.fromisoformat(self.written_at),
+            Written(self.salutation, tuple(Paragraph(p.ja, p.zh) for p in self.paragraphs)),
+        )
+
+
 class PackageData(_Strict):
     """`data.json`: a key for each category the package holds, none for the others."""
 
     profile: PackagedProfile | None = None
     conversations: list[PackagedConversation] | None = None
     memories: list[PackagedMemory] | None = None
+    cycles: list[PackagedCycle] | None = None
+    letters: list[PackagedLetter] | None = None
 
     @model_validator(mode="after")
     def _memories_told_in_conversations(self) -> "PackageData":
@@ -557,6 +685,14 @@ class Imported:
     memories: int = 0
     profile: bool = False
     skipped: list[Skipped] = field(default_factory=list)
+    cycles: int = 0
+    cycles_skipped: int = 0
+    """The periods written down that were not imported: of a character not here, out of
+    bounds, after today, or overlapping another of hers."""
+    letters: int = 0
+    """Only those not here already: of her, written at the same time."""
+    letters_skipped: int = 0
+    """The letters not imported, of characters not here."""
 
 
 def chosen(include: Iterable[Category]) -> list[Category]:
@@ -628,7 +764,7 @@ class DataPackages:
         but the pictures of their photos read at once, then written on a thread, reading
         the pictures one at a time."""
         categories = chosen(include)
-        profile, conversations, memories = await self._db.read(
+        profile, conversations, memories, cycles, letters = await self._db.read(
             self._read_data, user_id, categories
         )
         loop = asyncio.get_running_loop()
@@ -645,18 +781,28 @@ class DataPackages:
                 raise
 
         await asyncio.to_thread(
-            self._export, categories, profile, conversations, memories, picture_of, to
+            self._export, categories, profile, conversations, memories, cycles, letters,
+            picture_of, to,
         )
 
     def _read_data(
         self, db: sqlite3.Connection, user_id: str, categories: list[Category]
-    ) -> tuple[ProducerProfile | None, list[WholeConversation], list[Memory]]:
+    ) -> tuple[
+        ProducerProfile | None,
+        list[WholeConversation],
+        list[Memory],
+        list[cycle_records.Carried],
+        list[CarriedLetter],
+    ]:
         """What of the categories the user has, read through `db`, but the pictures of their
-        photos: their profile, conversations and memories."""
+        photos: their profile, conversations, memories, the periods they wrote down and the
+        letters she wrote."""
         return (
             read_profile(db, user_id) if "profile" in categories else None,
             read_whole_conversations(db, user_id) if "conversations" in categories else [],
             self._memories.read_kept(db, user_id) if "memories" in categories else [],
+            cycle_records.read_carried(db, user_id) if "cycles" in categories else [],
+            read_carried_letters(db, user_id) if "letters" in categories else [],
         )
 
     def _export(
@@ -665,6 +811,8 @@ class DataPackages:
         profile: ProducerProfile | None,
         conversations: list[WholeConversation],
         memories: list[Memory],
+        cycles: list[cycle_records.Carried],
+        letters: list[CarriedLetter],
         picture_of: Callable[[str], bytes | None],
         to: Path,
     ) -> None:
@@ -687,6 +835,14 @@ class DataPackages:
                 for m in memories
             ]
             counts["memories"] = len(data.memories)
+        if "cycles" in categories:
+            data.cycles = [PackagedCycle.of(r) for r in cycles]
+            counts["cycles"] = len(data.cycles)
+        if "letters" in categories:
+            data.letters = [
+                PackagedLetter.of(letter, self._name(letter.character_id)) for letter in letters
+            ]
+            counts["letters"] = len(data.letters)
         now = self._clock()
         manifest = Manifest(
             format=FORMAT, exported_at=_written(now), categories=categories, counts=counts
@@ -729,15 +885,25 @@ class DataPackages:
                     compress_type=zipfile.ZIP_STORED,  # a WebP is compressed already
                 )
 
-    async def import_(self, user_id: str, package: Path, include: Iterable[Category]) -> Imported:
+    async def import_(
+        self,
+        user_id: str,
+        package: Path,
+        include: Iterable[Category],
+        device_timezone: str | None,
+    ) -> Imported:
         """Import the categories of the package at `package` that `include` names into the
-        user's data, counted among today's imports; raises `TooNew` or `BrokenPackage`
+        user's data, counted among today's imports; the periods written down checked against
+        today where the producer is, by the profile imported with them, if any, else theirs,
+        else `device_timezone`. Raises `TooNew` or `BrokenPackage`
         having written nothing. The package is unzipped and checked on a thread first, then
         written in one write task, all at once or not at all. The memories it adds are
         embedded afterwards, in the background. Whether the user has imports left today is
         for the caller to check first (`check_imports_left`), while it holds `one_at_a_time`."""
         unpacked = await asyncio.to_thread(self._unpack, package, include)
-        imported = await self._db.write(_write_import, user_id, unpacked, self._clock())
+        imported = await self._db.write(
+            _write_import, user_id, unpacked, device_timezone, self._clock()
+        )
         if imported.memories:
             self._memories.embed_carried(user_id)
         return imported
@@ -759,6 +925,17 @@ class DataPackages:
             )
         if "memories" in categories and data.memories is not None:
             unpacked.memories = data.memories
+        if "cycles" in categories and data.cycles is not None:
+            unpacked.cycles = [
+                c.carried() for c in data.cycles if c.character_id in self._characters
+            ]
+            unpacked.cycles_skipped = len(data.cycles) - len(unpacked.cycles)
+        if "letters" in categories and data.letters is not None:
+            unpacked.letters = [
+                letter.carried() for letter in data.letters
+                if letter.character_id in self._characters
+            ]
+            unpacked.letters_skipped = len(data.letters) - len(unpacked.letters)
         return unpacked
 
     def _unpack_conversations(
@@ -806,6 +983,14 @@ class _Unpacked:
     conversations: list[_Carried] = field(default_factory=list)
     skipped: list[Skipped] = field(default_factory=list)
     memories: list[PackagedMemory] = field(default_factory=list)
+    cycles: list[cycle_records.Carried] = field(default_factory=list)
+    """The periods written down to add, of characters here."""
+    cycles_skipped: int = 0
+    """The periods written down of characters not here."""
+    letters: list[CarriedLetter] = field(default_factory=list)
+    """The letters to add, of characters here."""
+    letters_skipped: int = 0
+    """The letters of characters not here."""
 
 
 def _create(db: sqlite3.Connection) -> None:
@@ -821,11 +1006,15 @@ def _imports_made(db: sqlite3.Connection, user_id: str, since: str) -> int:
 
 
 def _write_import(
-    db: sqlite3.Connection, user_id: str, unpacked: _Unpacked, now: datetime
+    db: sqlite3.Connection,
+    user_id: str,
+    unpacked: _Unpacked,
+    device_timezone: str | None,
+    now: datetime,
 ) -> Imported:
     """Add what of a package is `unpacked` to the user's data through `db`, in the caller's
     transaction, as an import they made `now`; what it added."""
-    imported = Imported(skipped=unpacked.skipped)
+    imported = Imported(skipped=unpacked.skipped, letters_skipped=unpacked.letters_skipped)
     if unpacked.profile is not None and unpacked.profile != read_profile(db, user_id):
         write_profile(db, user_id, unpacked.profile)
         imported.profile = True
@@ -841,6 +1030,13 @@ def _write_import(
         imported.memories = add_carried(
             db, user_id, [m.carried(here) for m in unpacked.memories]
         )
+    if unpacked.cycles:
+        imported.cycles = cycle_records.add_carried(
+            db, user_id, unpacked.cycles, device_timezone, now
+        )
+    imported.cycles_skipped = unpacked.cycles_skipped + len(unpacked.cycles) - imported.cycles
+    if unpacked.letters:
+        imported.letters = add_carried_letters(db, user_id, unpacked.letters, now)
     db.execute(
         "DELETE FROM data_package_imports WHERE user_id = ? AND at < ?",
         (user_id, _today_began(now)),
@@ -880,6 +1076,16 @@ def _read(zipped: zipfile.ZipFile) -> tuple[Manifest, PackageData, dict[str, byt
             c.reach_outs for c in data.conversations or []
         ):
             raise BrokenPackage("reach-outs in a format before them")
+        if manifest.format < UNWELL_SINCE and any(
+            e.kind == "unwell" for c in data.conversations or [] for e in c.events
+        ):
+            raise BrokenPackage("her being unwell in a format before it")
+        if manifest.format < CYCLES_SINCE and data.cycles is not None:
+            raise BrokenPackage("periods written down in a format before them")
+        if manifest.format < CITY_SINCE and data.profile is not None and data.profile.city:
+            raise BrokenPackage("the producer's city in a format before it")
+        if manifest.format < LETTERS_SINCE and data.letters is not None:
+            raise BrokenPackage("letters in a format before them")
         listed = set(manifest.categories)
         held = {c for c in CATEGORIES if c != "photos" and getattr(data, c) is not None}
         photos = data.photos()

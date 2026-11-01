@@ -28,16 +28,41 @@ describe("路径和类别互转", () => {
 });
 
 describe("一级列表有哪几类", () => {
-  it("搭话放在通话和外观之间", () => {
-    expect(settingsGroups(false)[1]).toEqual(["call", "reach-outs", "appearance", "own-keys"]);
+  it("搭话放在通话和外观之间，朋友圈紧跟在搭话后面，再是周期", () => {
+    expect(settingsGroups({ reachOuts: false, moments: false, cycles: false })[1]).toEqual([
+      "call",
+      "reach-outs",
+      "moments",
+      "cycles",
+      "appearance",
+      "own-keys",
+    ]);
   });
 
-  it("账号里没有搭话（部署者没开）时没有这一类，别的照旧", () => {
-    expect(settingsGroups(null)).toEqual([
+  it("账号里没有搭话、朋友圈、周期（部署者没开）时没有这几类，别的照旧", () => {
+    expect(settingsGroups({ reachOuts: null, moments: null, cycles: null })).toEqual([
       ["profile", "memories", "stats"],
       ["call", "appearance", "own-keys"],
       ["sign-in", "data-package"],
       ["about"],
+    ]);
+  });
+
+  it("各看各的：只开周期时有周期、没有搭话和朋友圈", () => {
+    expect(settingsGroups({ reachOuts: null, moments: null, cycles: true })[1]).toEqual([
+      "call",
+      "cycles",
+      "appearance",
+      "own-keys",
+    ]);
+  });
+
+  it("只开朋友圈时有朋友圈，用户自己关了也还在", () => {
+    expect(settingsGroups({ reachOuts: null, moments: false, cycles: null })[1]).toEqual([
+      "call",
+      "moments",
+      "appearance",
+      "own-keys",
     ]);
   });
 });
@@ -64,7 +89,15 @@ describe("旧地址和不认识的地址换成哪个路径", () => {
 });
 
 describe("一级列表上的摘要", () => {
-  const blank: Draft = { formOfAddress: "", gender: "", timezone: "", birthMonth: null, birthDay: null };
+  const blank: Draft = {
+    formOfAddress: "",
+    gender: "",
+    timezone: "",
+    birthMonth: null,
+    birthDay: null,
+    city: null,
+    findsCities: false,
+  };
   const loading: SettingsValues = {
     profile: null,
     detectedTimezone: "Asia/Shanghai",
@@ -73,6 +106,8 @@ describe("一级列表上的摘要", () => {
     call: null,
     appearance: null,
     reachOuts: null,
+    moments: null,
+    cycles: null,
     ownServices: null,
     signInMethods: null,
   };
@@ -119,6 +154,16 @@ describe("一级列表上的摘要", () => {
   it("搭话是开／关", () => {
     expect(settingsSummaries({ ...loading, reachOuts: true })["reach-outs"]).toBe("开");
     expect(settingsSummaries({ ...loading, reachOuts: false })["reach-outs"]).toBe("关");
+  });
+
+  it("朋友圈是开／关", () => {
+    expect(settingsSummaries({ ...loading, moments: true }).moments).toBe("开");
+    expect(settingsSummaries({ ...loading, moments: false }).moments).toBe("关");
+  });
+
+  it("周期是开／关", () => {
+    expect(settingsSummaries({ ...loading, cycles: true }).cycles).toBe("开");
+    expect(settingsSummaries({ ...loading, cycles: false }).cycles).toBe("关");
   });
 
   it("自带密钥按 LLM、语音合成、语音识别的顺序列出填了的，一项都没填时「全部用部署者的服务」", () => {

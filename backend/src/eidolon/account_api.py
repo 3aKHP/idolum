@@ -6,7 +6,9 @@ Signing in with Google or GitHub goes through the browser:
     /api/auth/{provider}/callback  ← back from it, with a code and the state sent there
 
 The state is kept in a short-lived cookie of its own, so a callback can only finish a
-sign-in this browser started. The callback sends the browser on: home when signed in,
+sign-in this browser started. So is the code of the invite link the sign-in page was
+opened through, brought to `start` as `?invite=<code>`, for a new user to sign up with
+while only those invited may. The callback sends the browser on: home when signed in,
 the sign-in page with `?error=<reason>` when not (see `accounts.Refusal`, plus `state`
 for a callback this browser did not start or that expired, `cancelled` when the user
 turned the provider down, and `provider` when the provider could not be reached).
@@ -17,6 +19,7 @@ callback then sends the browser back to the sign-in settings (`/settings/sign-in
 """
 
 import logging
+import re
 import secrets
 from typing import Annotated, Any
 
@@ -46,7 +49,9 @@ from eidolon.config import (
     checked_extra_body,
     effort_problem,
 )
+from eidolon.cycles import CyclesOff
 from eidolon.identity import PROVIDER_NAMES, IdentityError
+from eidolon.moments import MomentsOff
 from eidolon.own_keys import NO_PHOTOS, BroughtKeys, OwnKeyRejected, named_services
 from eidolon.price_catalog import describe_offer, describe_provider, describe_thinking
 from eidolon.reach_outs import ReachOutsOff
@@ -66,6 +71,16 @@ log = logging.getLogger(__name__)
 STATE_COOKIE = "eidolon_oauth_state"
 STATE_LIFETIME = 600
 """How long, in seconds, the browser has to sign in at the provider and come back."""
+
+INVITE_CODE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+"""An invite link's code (`invites`), as the start of what the link brought may be."""
+
+
+def invite_code(invite: str | None) -> str:
+    """The code of the invite link a sign-in was started through, `invite` as the link brought
+    it, but whatever a chat app stuck to its end, a full stop say; empty for none."""
+    found = INVITE_CODE.match(invite or "")
+    return found.group() if found else ""
 
 
 class DevLogin(BaseModel):
@@ -230,6 +245,18 @@ class ReachOutSwitch(BaseModel):
     on: StrictBool
 
 
+class MomentSwitch(BaseModel):
+    """The user's own switch for moments (GLOSSARY.md「朋友圈」)."""
+
+    on: StrictBool
+
+
+class CycleSwitch(BaseModel):
+    """The user's own switch for cycles (GLOSSARY.md「周期」)."""
+
+    on: StrictBool
+
+
 class Consent(BaseModel):
     """Agreeing to the privacy policy and terms of use, and saying they are 13 or older."""
 
@@ -271,10 +298,10 @@ def add_account_routes(app: FastAPI, backend: Backend) -> None:
 
     @app.get("/api/auth/{provider}/start")
     async def start_sign_in(
-        provider: str, request: Request, link: bool = False
+        provider: str, request: Request, link: bool = False, invite: str | None = None
     ) -> RedirectResponse:
-        """Off to the provider to sign in, or with `link`, to link another identity to the
-        signed-in user."""
+        """Off to the provider to sign in, through the invite link with the code `invite` if
+        given, or with `link`, to link another identity to the signed-in user."""
         identity_provider = providers.get(provider)  # pyright: ignore[reportArgumentType]
         if identity_provider is None:
             raise HTTPException(404, "没有这种登录方式")
@@ -288,7 +315,7 @@ def add_account_routes(app: FastAPI, backend: Backend) -> None:
         )
         response.set_cookie(
             STATE_COOKIE,
-            f"{'link' if link else 'login'}:{provider}:{state}",
+            f"{'link' if link else 'login'}:{provider}:{state}:{'' if link else invite_code(invite)}",
             max_age=STATE_LIFETIME,
             path="/api/auth",
             httponly=True,
@@ -305,9 +332,9 @@ def add_account_routes(app: FastAPI, backend: Backend) -> None:
         state: str | None = None,
         error: str | None = None,
     ) -> RedirectResponse:
-        purpose, expected_provider, expected_state = (
-            request.cookies.get(STATE_COOKIE, "").split(":", 2) + ["", ""]
-        )[:3]
+        purpose, expected_provider, expected_state, invite = (
+            request.cookies.get(STATE_COOKIE, "").split(":", 3) + ["", "", ""]
+        )[:4]
         linking = purpose == "link"
         back = "/settings/sign-in" if linking else "/login"
 
@@ -339,7 +366,7 @@ def add_account_routes(app: FastAPI, backend: Backend) -> None:
                     return go("/login?error=state")
                 await accounts.link(user.id, identity)
                 return go(f"/settings/sign-in?linked={provider}")
-            user = await accounts.sign_in(identity)
+            user = await accounts.sign_in(identity, invite or None)
         except SignInRefused as e:
             return go(f"{back}?error={e.reason}")
         response = go("/conversations")
@@ -359,12 +386,17 @@ def add_account_routes(app: FastAPI, backend: Backend) -> None:
         identities they sign in with, whether they are an admin, who may enter the admin
         console, the exempting keys now (GLOSSARY.md「免限额密钥」), in a fixed order, and
         whether they have their own switch for reach-outs on (GLOSSARY.md「搭话」), None where
-        the deployer has reach-outs off, and the version of the sponsor code (GLOSSARY.md
-        「赞赏」) while users are shown it, else None."""
+        the deployer has reach-outs off, likewise for cycles (GLOSSARY.md「周期」) and for
+        moments (GLOSSARY.md「朋友圈」), whether the deployer has letters on (GLOSSARY.md「信」),
+        the version of the sponsor code (GLOSSARY.md「赞赏」)
+        while users are shown it, else None, and whether the deployer has a key for speech synthesis now, which reads her
+        words aloud to those who bring none of their own (GLOSSARY.md「朗读」)."""
         sponsor = await backend.sponsor.state()
         user = await store.get_user(user_id)
         methods = await store.sign_in_methods(user_id)
         reach_outs = await backend.reach_outs.switch_of(user_id)
+        cycles = await backend.cycles.switch_of(user_id)
+        moments = await backend.moments.switch_of(user_id)
         return {
             "id": user_id,
             "name": user.name,
@@ -375,7 +407,11 @@ def add_account_routes(app: FastAPI, backend: Backend) -> None:
             "is_admin": signs_in_as_admin(methods, settings),
             "exempting_keys": [s for s in SERVICES if s in backend.config.exempting_keys],
             "reach_outs": reach_outs,
+            "cycles": cycles,
+            "moments": moments,
+            "letters": backend.config.letters_on,
             "sponsor_version": sponsor.version,
+            "deployer_tts": backend.config.has_service("tts"),
         }
 
     @app.put("/api/account/reach-outs", status_code=204)
@@ -386,6 +422,24 @@ def add_account_routes(app: FastAPI, backend: Backend) -> None:
             await backend.reach_outs.switch(user_id, body.on)
         except ReachOutsOff:
             raise HTTPException(409, "搭话没有开放") from None
+
+    @app.put("/api/account/cycles", status_code=204)
+    async def switch_cycles(body: CycleSwitch, user_id: UserId) -> None:
+        """Turn the user's own switch for cycles on or off, for all the characters; 409
+        where the deployer has cycles off."""
+        try:
+            await backend.cycles.switch(user_id, body.on)
+        except CyclesOff:
+            raise HTTPException(409, "周期没有开放") from None
+
+    @app.put("/api/account/moments", status_code=204)
+    async def switch_moments(body: MomentSwitch, user_id: UserId) -> None:
+        """Turn the user's own switch for moments on or off, for all the characters; 409
+        where the deployer has moments off."""
+        try:
+            await backend.moments.switch(user_id, body.on)
+        except MomentsOff:
+            raise HTTPException(409, "朋友圈没有开放") from None
 
     @app.delete("/api/account/sign-in-methods/{provider}", status_code=204)
     async def unlink(provider: str, user_id: UserId) -> None:

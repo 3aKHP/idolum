@@ -10,6 +10,7 @@ function latest(last: LatestConversation["last_message"]): LatestConversation {
     created_at: "2026-09-28T01:00:00Z",
     last_message: last,
     unseen_reach_out: false,
+    unread_letter: false,
   };
 }
 
@@ -54,6 +55,20 @@ describe("previewOf", () => {
 
     expect(hungUp).toEqual({ from: "event", event: "hung_up", gift: null, at: "2026-09-28T03:00:00Z" });
     expect(gift).toEqual({ from: "event", event: "gift", gift: "蛋糕", at: "2026-09-28T04:00:00Z" });
+  });
+
+  it("最后是她不太舒服了时，预览带上从哪天起", () => {
+    const unwell = previewOf(
+      latest({ type: "event", kind: "unwell", created_at: "2026-09-28T03:00:00Z", first_day: "2026-09-21", days_ago: 7 }),
+    );
+
+    expect(unwell).toEqual({
+      from: "event",
+      event: "unwell",
+      gift: null,
+      unwell: { firstDay: "2026-09-21", daysAgo: 7 },
+      at: "2026-09-28T03:00:00Z",
+    });
   });
 
   it("刚开的新对话没有最后一句，时间是对话开始的时间", () => {
@@ -101,6 +116,7 @@ describe("arrange", () => {
       created_at: opened,
       last_message: lastAt === null ? null : { role: "user", text: "早", ja: null, zh: null, created_at: lastAt },
       unseen_reach_out: false,
+      unread_letter: false,
     };
   }
 
@@ -168,7 +184,7 @@ describe("arrange 加上隐藏、置顶和搜索", () => {
       ["mano", "2026-10-01T00:00:00Z"],
     ].map(([id, at]) => [
       id,
-      { character_id: id, conversation_id: `c-${id}`, created_at: at, last_message: null, unseen_reach_out: false },
+      { character_id: id, conversation_id: `c-${id}`, created_at: at, last_message: null, unseen_reach_out: false, unread_letter: false },
     ]),
   );
 
@@ -255,6 +271,7 @@ describe("没看过的搭话", () => {
             ...(unseen.includes(id) && { reach_out: true as const }),
           },
           unseen_reach_out: unseen.includes(id),
+          unread_letter: false,
         },
       ]),
     );
@@ -270,6 +287,15 @@ describe("没看过的搭话", () => {
 
   it("当前对话正显示着的那位不标", () => {
     expect(marked(withUnseen("hiori", "meguru"), { onScreen: "hiori" })).toEqual(["meguru"]);
+  });
+
+  it("她有没读过的信，她那一行名字后面一枚小信封；正显示着她的对话也照样标", () => {
+    const enveloped = (options: Parameters<typeof arrange>[2]) =>
+      arrange(characters, withUnseen(), options).rows.filter((row) => row.hasUnreadLetter).map((row) => row.character.id);
+
+    expect(enveloped({ unreadLetters: new Set(["mano", "meguru"]) })).toEqual(["mano", "meguru"]);
+    expect(enveloped({ unreadLetters: new Set(["mano"]), onScreen: "mano" })).toEqual(["mano"]);
+    expect(enveloped({})).toEqual([]);
   });
 
   it("导航上的点：只要列表里有一行有没看过的搭话；当前对话正显示着的、在这台设备上隐藏了的、配置里已经没有的不算", () => {

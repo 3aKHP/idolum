@@ -1,16 +1,17 @@
 // 消息列表每一行的内容：她最新一次对话的最后一句和时间（spec「信息架构」）；以及显示哪些行、按什么顺序排。
 // 只给出结构，文字由界面按当前语言拼（`copy.conversationList`）。
 
-import type { EventKind, LatestConversation } from "@/lib/api";
+import type { LatestConversation } from "@/lib/api";
 import { matchesSearch, type Searchable } from "@/lib/characterSearch";
+import { type EventShown, unwellOf } from "@/lib/conversationEvents";
 import { NO_PREFERENCES, type ListPreferences } from "@/lib/listPreferences";
 
 /** 列表里的一行预览。`from` 为 null 表示对话已经开了但还没有话；她的话带着发出来了的照片时 `photo`
- * 为 true，界面在前面加相机；`event` 是一条对话事件，原文由界面拼，送礼记录带礼物名（`gift`）。 */
+ * 为 true，界面在前面加相机；`event` 是一条对话事件，那句话见 `eventText`。 */
 export type Preview =
   | { from: "her"; text: string; at: string; photo: boolean }
   | { from: "you" | null; text: string; at: string }
-  | { from: "event"; event: EventKind; gift: string | null; at: string };
+  | ({ from: "event"; at: string } & EventShown);
 
 /** 她最新一次对话的预览（`previewOf` 一段对话）；从没聊过的角色没有预览。 */
 export function previewOf(latest: LatestConversation | undefined): Preview | null {
@@ -22,14 +23,16 @@ export function previewOf(latest: LatestConversation | undefined): Preview | nul
 export function previewOfOne(conversation: Pick<LatestConversation, "created_at" | "last_message">): Preview {
   const last = conversation.last_message;
   if (!last) return { from: null, text: "", at: conversation.created_at };
-  if ("type" in last) return { from: "event", event: last.kind, gift: last.gift_name ?? null, at: last.created_at };
+  if ("type" in last) {
+    return { from: "event", event: last.kind, gift: last.gift_name ?? null, unwell: unwellOf(last), at: last.created_at };
+  }
   if (last.role === "user") return { from: "you", text: last.text ?? "", at: last.created_at };
   return { from: "her", text: last.zh || last.ja || "", at: last.created_at, photo: last.photo === true };
 }
 
 /** 列表里的一行：哪位角色，她是不是置顶的、是不是隐藏的（行菜单和图钉据此显示），有没有没看过的搭话
- * （GLOSSARY.md「没看过的搭话」，时间前面的圆点据此显示）。 */
-export type ListRow<C> = { character: C; isPinned: boolean; isHidden: boolean; isUnseen: boolean };
+ * （GLOSSARY.md「没看过的搭话」，时间前面的圆点据此显示），有没有没读过的信（GLOSSARY.md「没读过的信」，名字后面的小信封据此显示）。 */
+export type ListRow<C> = { character: C; isPinned: boolean; isHidden: boolean; isUnseen: boolean; hasUnreadLetter: boolean };
 
 export type ArrangeOptions = {
   /** 这台设备上的隐藏和置顶。 */
@@ -40,6 +43,8 @@ export type ArrangeOptions = {
   keep?: readonly string[];
   /** 她的当前对话正显示在对话页上的那位：搭话在那一页上直接出现、算看过，她那一行不标。 */
   onScreen?: string | null;
+  /** 有没读过的信的那几位（lib/letter 的 `unreadFrom`）。信不随对话显示，正显示着她的对话也照样标。 */
+  unreadLetters?: ReadonlySet<string>;
 };
 
 /**
@@ -47,13 +52,14 @@ export type ArrangeOptions = {
  * - 没有搜索时去掉隐藏的人，`keep` 里的不去掉；有搜索时在所有人里搜（`matchesSearch`），隐藏的照样出现。
  * - 置顶的排在前面；置顶的之间、其余的之间都按最近往来排，往来的时间就是这一行显示的时间（`previewOf`）；
  *   时间相同的、从没聊过的（排在最后）都保持 `characters` 原来的顺序，即原作的偶像顺序。
- * - 她最新的对话里有没看过的搭话的那一行标出来（`isUnseen`），当前对话正显示着的那位（`onScreen`）除外。
+ * - 她最新的对话里有没看过的搭话的那一行标出来（`isUnseen`），当前对话正显示着的那位（`onScreen`）除外；
+ *   她有没读过的信的那一行也标出来（`hasUnreadLetter`）。
  * `hiddenCount` 是这台设备上隐藏的人数，只数 `characters` 里还有的。
  */
 export function arrange<C extends Searchable & { id: string }>(
   characters: C[],
   latest: Record<string, LatestConversation>,
-  { preferences = NO_PREFERENCES, query = "", keep = [], onScreen = null }: ArrangeOptions = {},
+  { preferences = NO_PREFERENCES, query = "", keep = [], onScreen = null, unreadLetters }: ArrangeOptions = {},
 ): { rows: ListRow<C>[]; hiddenCount: number } {
   const hidden = new Set(preferences.hidden);
   const pinned = new Set(preferences.pinned);
@@ -71,6 +77,7 @@ export function arrange<C extends Searchable & { id: string }>(
         isPinned: pinned.has(c.id),
         isHidden: hidden.has(c.id),
         isUnseen: c.id !== onScreen && latest[c.id]?.unseen_reach_out === true,
+        hasUnreadLetter: unreadLetters?.has(c.id) ?? false,
       },
       at: lastTalked(c),
     }))

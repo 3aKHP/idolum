@@ -35,16 +35,32 @@ USER_DATA = [
     ("conversations", "user_id = ?"),
     ("producer_profiles", "user_id = ?"),
     ("affinities", "user_id = ?"),
+    ("schedule_placements", "user_id = ?"),
+    ("visit_records", "user_id = ?"),
     ("gift_balances", "user_id = ?"),
     ("gift_backpacks", "user_id = ?"),
     ("gift_rewards", "user_id = ?"),
-    ("daily_task_progress", "user_id = ?"),
     ("achievement_progress", "user_id = ?"),
     ("achievement_stages", "user_id = ?"),
     ("usage", "user_id = ?"),
     ("user_limits", "user_id = ?"),
     ("reach_outs_off", "user_id = ?"),
+    ("moment_circle", "moment_id IN (SELECT id FROM moments WHERE user_id = ?)"),
+    ("moment_images", "moment_id IN (SELECT id FROM moments WHERE user_id = ?)"),
+    ("moment_likes", "moment_id IN (SELECT id FROM moments WHERE user_id = ?)"),
+    ("moment_comments", "moment_id IN (SELECT id FROM moments WHERE user_id = ?)"),
+    ("moments", "user_id = ?"),
+    ("moment_plans", "user_id = ?"),
+    ("moment_users", "user_id = ?"),
+    ("moments_off", "user_id = ?"),
+    ("letter_voices", "letter_id IN (SELECT id FROM letters WHERE user_id = ?)"),
+    ("letters", "user_id = ?"),
+    ("letters_due", "user_id = ?"),
+    ("letter_users", "user_id = ?"),
+    ("cycles_off", "user_id = ?"),
+    ("cycle_records", "user_id = ?"),
     ("data_package_imports", "user_id = ?"),
+    ("invited_users", "user_id = ?"),
     ("sessions", "user_id = ?"),
     ("sign_in_methods", "user_id = ?"),
     ("users", "id = ?"),
@@ -79,12 +95,14 @@ for each deleted user, the same for all their rows, so that they still count as 
 
 NOT_USER_DATA = frozenset(
     {
-        "episodes", "episode_cast", "episode_lines", "episode_passages", "embedded_texts",
+        "episodes", "episode_cast", "episode_lines", "episode_passages",
+        "story_corpus_version", "embedded_texts",
         "service_calls", "config_overrides", "price_overrides", "price_catalog",
         "price_catalog_thinking", "price_catalog_hosts", "price_catalog_providers",
         "price_catalog_offers", "price_catalog_state", "banned_identities", "announcements",
         "sponsor", "gifts_opened", "reset_card_grants", "backup_runs", "record_rollups",
         "taken_rollups", "call_rollups", "spread_rollups", "achievements_launched",
+        "weekly_jobs", "invites",
     }
 )
 """Every other table: the story corpus, the embedded text set, the calls to outside
@@ -95,7 +113,9 @@ with, which say whose they were to no one, the announcements admins write, which
 nothing of who wrote them, the sponsor code admins upload, when gifts last opened, which
 is no one's, and the reset cards admins have given every user, which say nothing of who
 gave them or to whom, the record of each backup run, which says nothing of anyone's, and
-when the achievements launched, which is no one's."""
+when the achievements launched, which is no one's, each week's jobs, the same for
+everyone, and the invite links admins make, which say nothing of who made them, those who
+signed up through each being the users' own."""
 
 
 HEALTH_READ_TIMEOUT = 2.0
@@ -124,14 +144,18 @@ def connect(path: Path) -> sqlite3.Connection:
     return db
 
 
+def read_only(path: Path, timeout: float = 5.0) -> sqlite3.Connection:
+    """A read-only connection of its own to the database at `path`, outside the data
+    access layer so as to wait on no write task, making no database where there is none;
+    raises sqlite3.Error if it cannot be opened."""
+    return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=timeout)
+
+
 def readable(path: Path) -> bool:
-    """Whether the database at `path` can be read now, on a read-only connection of its
-    own, outside the data access layer so as to wait on no write task, nor make a
-    database where there is none; for the health check."""
+    """Whether the database at `path` can be read now, on a `read_only` connection; for
+    the health check."""
     try:
-        db = sqlite3.connect(
-            f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=HEALTH_READ_TIMEOUT
-        )
+        db = read_only(path, HEALTH_READ_TIMEOUT)
         try:
             db.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
         finally:

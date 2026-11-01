@@ -19,5 +19,12 @@
     "reason": "why the difference is wanted",
     "decided": "YYYY-MM-DD",
     "adr": "optional: docs/adr/ number if the deviation got its own ADR"
+  },
+  "snapshot": {
+    "captured_at": "2026-11-01",
+    "local_base": "58d53286855a626b6e999831ec40ce6dc382e238",
+    "upstream_repo": "Sallyn0225/eidolon-sc",
+    "upstream_commit": "f6cee74b17c59a6da49ae17888b5ff38f54ed3fb",
+    "description": "Current HTTP and SQLite snapshots include the complete upstream v0.5.0 integration. The oracle above records the original pre-import reference; pin the eventual integrated commit as the behavior oracle before starting Go differential tests."
   }
 }

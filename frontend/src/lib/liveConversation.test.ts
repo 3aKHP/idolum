@@ -2259,11 +2259,10 @@ describe("LiveConversation: the list", () => {
 });
 
 describe("LiveConversation: rewards", () => {
-  const oneTurn: Rewarded = {
+  const tenthTurn: Rewarded = {
     draws: 1,
     reset_cards: 0,
-    daily_tasks: ["one_turn"],
-    achievements: [],
+    achievements: [{ achievement: "turns", character_id: "hikari", stage: 1, draws: 1 }],
     completed: [],
     rewarded_at: "2026-10-20T08:00:00+00:00",
   };
@@ -2272,7 +2271,7 @@ describe("LiveConversation: rewards", () => {
     const turns = [
       scripted([
         { type: "user", text: "你好" },
-        { type: "done", message: message(4, "character", "こんにちは"), affinity: null, rewarded: oneTurn },
+        { type: "done", message: message(4, "character", "こんにちは"), affinity: null, rewarded: tenthTurn },
       ]),
       scripted([
         { type: "user", text: "再见" },
@@ -2287,8 +2286,8 @@ describe("LiveConversation: rewards", () => {
     live.setDraft("再见");
     await live.submit();
 
-    expect(once).toEqual([oneTurn]);
-    expect(rewarded).toEqual([oneTurn]);
+    expect(once).toEqual([tenthTurn]);
+    expect(rewarded).toEqual([tenthTurn]);
   });
 
   it("tells the shell what a turn in a call was rewarded with", async () => {
@@ -2297,9 +2296,9 @@ describe("LiveConversation: rewards", () => {
     const { handlers } = attempts[0];
 
     handlers.onEvent({ type: "user", text: "你好", reply: 1 });
-    handlers.onEvent({ type: "done", message: message(4, "character", "こんにちは"), affinity: null, rewarded: oneTurn });
+    handlers.onEvent({ type: "done", message: message(4, "character", "こんにちは"), affinity: null, rewarded: tenthTurn });
 
-    expect(rewarded).toEqual([oneTurn]);
+    expect(rewarded).toEqual([tenthTurn]);
   });
 });
 
@@ -2308,7 +2307,6 @@ describe("LiveConversation: the trophy", () => {
   const unlocked = (...achievements: Rewarded["achievements"]): Rewarded => ({
     draws: achievements.reduce((n, a) => n + a.draws, 0),
     reset_cards: 0,
-    daily_tasks: [],
     achievements,
     completed: [],
     rewarded_at: at,
@@ -2633,7 +2631,7 @@ describe("LiveConversation: what the list shows newer", () => {
   /** The list's line for her: her conversation `id`, its last line said at `at`, a reach-out. */
   function listedAs(at: string, id = "c1"): LatestConversation {
     const last = { role: "character" as const, text: null, ja: "", zh: "", created_at: at, reach_out: true as const };
-    return { character_id: "hikari", conversation_id: id, created_at: "2026-09-27T00:00:00Z", last_message: last, unseen_reach_out: true };
+    return { character_id: "hikari", conversation_id: id, created_at: "2026-09-27T00:00:00Z", last_message: last, unseen_reach_out: true, unread_letter: false };
   }
 
   /** Her conversation, its record in the backend `now()` as it is then, each reading counted. */

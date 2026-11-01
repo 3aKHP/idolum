@@ -1,5 +1,6 @@
--- idolum SQLite schema: fresh backend startup + story-corpus tables (created lazily on import)
--- 51 tables total
+-- SQLite schema snapshot after integrating upstream v0.5.0 (f6cee74b), 2026-11-01.
+-- 70 application tables, including lazily initialized story corpus and embedded texts.
+-- Captured from an isolated temporary database; no deployment data.
 
 CREATE TABLE achievement_progress (
     user_id TEXT NOT NULL REFERENCES users(id),
@@ -39,7 +40,8 @@ CREATE TABLE activity_records (
     manipulation INTEGER,
     cooled INTEGER,
     ended_conversation TEXT,
-    answered INTEGER NOT NULL DEFAULT 0
+    answered INTEGER NOT NULL DEFAULT 0,
+    degraded TEXT
 );
 CREATE TABLE affinities (
     user_id TEXT NOT NULL REFERENCES users(id),
@@ -49,6 +51,7 @@ CREATE TABLE affinities (
     cooling INTEGER NOT NULL DEFAULT 0,
     gained_today REAL NOT NULL DEFAULT 0,
     gained_on TEXT,
+    considerate_today REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, character_id)
 );
 CREATE TABLE announcements (
@@ -118,7 +121,9 @@ CREATE TABLE conversation_events (
     created_at TEXT NOT NULL,
     affinity TEXT,
     gift_id TEXT,
-    liked INTEGER NOT NULL DEFAULT 0
+    liked INTEGER NOT NULL DEFAULT 0,
+    first_day TEXT,
+    days_ago INTEGER
 );
 CREATE TABLE conversations (
     id TEXT PRIMARY KEY,
@@ -127,11 +132,16 @@ CREATE TABLE conversations (
     created_at TEXT NOT NULL,
     title TEXT
 );
-CREATE TABLE daily_task_progress (
-    user_id TEXT PRIMARY KEY REFERENCES users(id),
-    day TEXT NOT NULL,
-    turns INTEGER NOT NULL,
-    gifts INTEGER NOT NULL
+CREATE TABLE cycle_records (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    character_id TEXT NOT NULL,
+    first_day TEXT NOT NULL,
+    days INTEGER NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE TABLE cycles_off (
+    user_id TEXT PRIMARY KEY REFERENCES users(id)
 );
 CREATE TABLE data_package_imports (
     user_id TEXT NOT NULL,
@@ -198,6 +208,51 @@ CREATE TABLE gifts_opened (
     open INTEGER NOT NULL,
     opened_at TEXT
 );
+CREATE TABLE invited_users (
+    user_id TEXT PRIMARY KEY REFERENCES users(id),
+    invite_id INTEGER NOT NULL REFERENCES invites(id)
+);
+CREATE TABLE invites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    note TEXT,
+    max_uses INTEGER NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE letter_users (
+    user_id TEXT PRIMARY KEY REFERENCES users(id),
+    planned_day TEXT NOT NULL
+);
+CREATE TABLE letter_voices (
+    letter_id INTEGER NOT NULL REFERENCES letters(id),
+    block INTEGER NOT NULL,
+    mp3 BLOB NOT NULL,
+    PRIMARY KEY (letter_id, block)
+);
+CREATE TABLE letters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    character_id TEXT NOT NULL,
+    occasions TEXT NOT NULL,
+    day TEXT NOT NULL,
+    written_at TEXT NOT NULL,
+    salutation TEXT NOT NULL,
+    paragraphs TEXT NOT NULL,
+    read_at TEXT,
+    popped_at TEXT,
+    record_id INTEGER
+);
+CREATE TABLE letters_due (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    character_id TEXT NOT NULL,
+    occasion TEXT NOT NULL,
+    day TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL REFERENCES users(id),
@@ -227,6 +282,65 @@ CREATE TABLE messages (
     affinity TEXT,
     hurt REAL,
     out_of_line INTEGER
+);
+CREATE TABLE moment_circle (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    moment_id INTEGER NOT NULL REFERENCES moments(id),
+    character_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    ja TEXT,
+    zh TEXT,
+    position INTEGER NOT NULL,
+    shown_at TEXT NOT NULL
+);
+CREATE TABLE moment_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    moment_id INTEGER NOT NULL UNIQUE REFERENCES moments(id),
+    text TEXT NOT NULL,
+    commented_at TEXT NOT NULL,
+    reply_at TEXT,
+    reply_ja TEXT,
+    reply_zh TEXT
+);
+CREATE TABLE moment_images (
+    moment_id INTEGER PRIMARY KEY REFERENCES moments(id),
+    image BLOB NOT NULL
+);
+CREATE TABLE moment_likes (
+    moment_id INTEGER PRIMARY KEY REFERENCES moments(id)
+);
+CREATE TABLE moment_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    character_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    birthday INTEGER NOT NULL
+);
+CREATE TABLE moment_users (
+    user_id TEXT PRIMARY KEY REFERENCES users(id),
+    planned_day TEXT,
+    opened_at TEXT
+);
+CREATE TABLE moments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    character_id TEXT NOT NULL,
+    ja TEXT NOT NULL,
+    zh TEXT NOT NULL,
+    image TEXT,
+    place_id TEXT,
+    place_name TEXT,
+    place_lat REAL,
+    place_lon REAL,
+    weather TEXT,
+    temperature INTEGER,
+    day TEXT NOT NULL,
+    posted_at TEXT NOT NULL
+);
+CREATE TABLE moments_off (
+    user_id TEXT PRIMARY KEY REFERENCES users(id)
 );
 CREATE TABLE photos (
     id TEXT PRIMARY KEY,
@@ -298,7 +412,14 @@ CREATE TABLE producer_profiles (
     timezone TEXT,
     updated_at TEXT NOT NULL,
     birthday_month INTEGER,
-    birthday_day INTEGER
+    birthday_day INTEGER,
+    -- Where the producer is, as QWeather found it (`producer.City`): NULL for nowhere set.
+    city_name TEXT,
+    city_adm2 TEXT,
+    city_adm1 TEXT,
+    city_country TEXT,
+    city_latitude REAL,
+    city_longitude REAL
 );
 CREATE TABLE reach_out_schedules (
     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),
@@ -342,6 +463,16 @@ CREATE TABLE record_rollups (
 CREATE TABLE reset_card_grants (
     granted_at TEXT NOT NULL,
     count INTEGER NOT NULL
+);
+CREATE TABLE schedule_placements (
+    user_id TEXT NOT NULL REFERENCES users(id),
+    week TEXT NOT NULL,
+    job_id TEXT NOT NULL REFERENCES weekly_jobs(id),
+    day INTEGER NOT NULL,
+    slot INTEGER NOT NULL,
+    saved_at TEXT NOT NULL,
+    counted_at TEXT,
+    PRIMARY KEY (user_id, week, job_id)
 );
 CREATE TABLE service_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -394,6 +525,10 @@ CREATE TABLE spread_rollups (
     most REAL NOT NULL,
     PRIMARY KEY (length, start, measure, service, own_key, bucket)
 ) WITHOUT ROWID;
+CREATE TABLE story_corpus_version (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL
+);
 CREATE TABLE taken_rollups (
     start INTEGER PRIMARY KEY,
     turns INTEGER NOT NULL,
@@ -412,7 +547,9 @@ CREATE TABLE user_limits (
     calls_per_hour INTEGER,
     note TEXT,
     updated_at TEXT NOT NULL,
-    photos_per_hour INTEGER
+    photos_per_hour INTEGER,
+    visits_per_hour INTEGER,
+    read_alouds_per_hour INTEGER
 );
 CREATE TABLE user_rollups (
     length INTEGER NOT NULL,
@@ -429,45 +566,28 @@ CREATE TABLE users (
     banned_at TEXT,
     ban_note TEXT
 );
-
-CREATE INDEX activity_records_by_time ON activity_records(started_at);
-
-CREATE INDEX activity_records_by_user ON activity_records(user_id, started_at);
-
-CREATE INDEX calls_by_conversation ON calls(conversation_id);
-
-CREATE INDEX conversation_events_by_conversation
-    ON conversation_events(conversation_id, created_at);
-
-CREATE INDEX conversations_by_user
-    ON conversations(user_id, character_id, created_at);
-
-CREATE INDEX data_package_imports_by_user ON data_package_imports (user_id, at);
-
-CREATE INDEX episode_cast_by_character ON episode_cast(character_id);
-
-CREATE INDEX memories_by_conversation ON memories(conversation_id);
-
-CREATE INDEX memory_vectors_by_user ON memory_vectors(user_id, model);
-
-CREATE INDEX messages_by_conversation ON messages(conversation_id, id);
-
-CREATE INDEX photos_by_conversation ON photos(conversation_id);
-
-CREATE INDEX reach_outs_by_conversation ON reach_outs(conversation_id, created_at);
-
-CREATE INDEX service_calls_by_record ON service_calls(record_id);
-
-CREATE INDEX service_calls_by_time ON service_calls(at);
-
-CREATE INDEX sessions_by_expiry ON sessions(expires_at);
-
-CREATE INDEX sessions_by_user ON sessions(user_id);
-
-CREATE INDEX sign_in_methods_by_user ON sign_in_methods(user_id);
-
-CREATE INDEX usage_by_time ON usage(at);
-
-CREATE INDEX usage_by_user ON usage(user_id, kind, at);
-
-CREATE INDEX user_rollups_by_who ON user_rollups(who);
+CREATE TABLE visit_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    character_id TEXT NOT NULL,
+    entered_at TEXT NOT NULL,
+    left_at TEXT NOT NULL,
+    entered_on TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    orders TEXT NOT NULL,
+    drunk INTEGER NOT NULL,
+    rewarded INTEGER NOT NULL
+);
+CREATE TABLE weekly_jobs (
+    id TEXT PRIMARY KEY,
+    week TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    character_id TEXT NOT NULL,
+    listed_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    note TEXT NOT NULL,
+    category TEXT NOT NULL,
+    length INTEGER NOT NULL,
+    slots TEXT
+);

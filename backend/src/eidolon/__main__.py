@@ -37,6 +37,16 @@
     eidolon stand upload             upload the outfits the lists name, their thumbnails and
                                      the lists to the S3-compatible bucket, skipping what it
                                      has as it is; exits 2 if the bucket failed
+    eidolon bar upload <audio dir>   upload the original game's tracks and sound effects
+                                     the bar's audio list names, from the deployer's
+                                     extracted audio directory, to the stands' bucket, and
+                                     last the manifest of what it has; exits 2 if the
+                                     bucket failed, 3 if some files were missing
+    eidolon letter-music upload <dir>
+                                     upload the music under letters the list beside the
+                                     character configuration names, from the deployer's
+                                     directory, to the stands' bucket; exits 2 if the
+                                     bucket failed, 3 if some files were missing
     eidolon reading draft            draft the readings file beside the character
                                      configuration from the characters' sheets and the
                                      world setting, or fill in the phonemes it lacks and
@@ -60,6 +70,10 @@
                                      stopped (deploy/db-restore.sh), if it is whole and has
                                      this project's tables, leaving it alone if not; and
                                      say how many users it has; --check only checks it
+    eidolon doctor [--json]          try each service .env configures, the way the server
+                                     reaches it, through the proxy and direct, and say
+                                     what is wrong and what to change; exits 1 if anything
+                                     is (docs/agents/deploying.md)
     eidolon reembed                  after changing the embedding service, model or
                                      dimensions, embed the story corpus, character facts,
                                      work facts, and memories again from
@@ -74,6 +88,10 @@
                                      take the memory eval set's turns on the deployer's
                                      background model, embedder, reranker and judge
                                      model, and count what passes by category
+    eidolon eval moments --html F [--model M] [--runs N]
+                                     have the deployer's chat model, or model M, write the
+                                     moments eval set's moments and replies, N times each,
+                                     into the page F, the parts made do without marked
 """
 
 import argparse
@@ -108,6 +126,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command in (None, "serve"):
         return _serve()
+    if args.command == "doctor":
+        from eidolon.doctor import run
+
+        return asyncio.run(run(args.json))
     if args.command == "story" and args.action == "sync":
         return asyncio.run(_sync_story(args))
     if args.command == "story":
@@ -122,6 +144,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _stand_outfits(args)
     if args.command == "stand":
         return asyncio.run(_stand_upload(args))
+    if args.command == "bar":
+        return asyncio.run(_bar_upload(args))
+    if args.command == "letter-music":
+        return asyncio.run(_letter_music_upload(args))
     if args.command == "reading":
         return _draft_readings(args)
     if args.command == "greeting":
@@ -136,6 +162,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_eval_judge(args))
     if args.command == "eval" and args.action == "memory":
         return asyncio.run(_eval_memory(args))
+    if args.command == "eval" and args.action == "moments":
+        return asyncio.run(_eval_moments(args))
     if args.command == "eval":
         return asyncio.run(_eval_rerank(args))
 
@@ -323,7 +351,7 @@ async def _sync_story(args: argparse.Namespace) -> int:
 
     progress = logging.StreamHandler()  # the first sync takes an hour or two
     progress.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S"))
-    for name in ("eidolon.story_sync", "eidolon.story_import"):
+    for name in ("eidolon.story_sync", "eidolon.story_import", "eidolon.mirror"):
         logging.getLogger(name).addHandler(progress)
         logging.getLogger(name).setLevel(logging.INFO)
     embedder = open_embedder(settings)
@@ -362,9 +390,9 @@ async def _sync_story(args: argparse.Namespace) -> int:
         f"本次检查的卡牌和相册中有 {report.translations_kept} 段已有汉化版，保留汉化版"
     )
     if report.missing:
-        print(f"卡牌列出的剧本中有 {report.missing} 个镜像上还没有，下次同步再试")
+        print(f"卡牌列出的剧本中有 {report.missing} 个镜像和官方 CDN 上都还没有，下次同步再试")
     if report.album_missing:
-        print(f"相册列出的剧本中有 {report.album_missing} 个镜像上没有，相册有变化时再试")
+        print(f"相册列出的剧本中有 {report.album_missing} 个镜像和官方 CDN 上都没有，相册有变化时再试")
     if report.unnamed_events:
         events = "、".join(f"{event:03d}" for event in report.unnamed_events)
         print(f"活动名对照表里还没有这些活动，暂用「活动剧情 NNN」：{events}")
@@ -412,8 +440,9 @@ async def _stand_fetch(args: argparse.Namespace) -> int:
 
     progress = logging.StreamHandler()  # the first fetch takes a quarter of an hour or so
     progress.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S"))
-    logging.getLogger("eidolon.stand_fetch").addHandler(progress)
-    logging.getLogger("eidolon.stand_fetch").setLevel(logging.INFO)
+    for name in ("eidolon.stand_fetch", "eidolon.mirror"):
+        logging.getLogger(name).addHandler(progress)
+        logging.getLogger(name).setLevel(logging.INFO)
     mirror = Mirror()
     try:
         characters = load_characters(
@@ -496,6 +525,83 @@ async def _stand_upload(args: argparse.Namespace) -> int:
         f"上传 {report.uploaded} 个文件（{report.uploaded_bytes / 1_000_000:.1f} MB），"
         f"{report.unchanged} 个存储桶里已有、内容没变，没有上传；用时 {time.monotonic() - started:.0f} 秒"
     )
+    return 0
+
+
+async def _bar_upload(args: argparse.Namespace) -> int:
+    from eidolon.bar_upload import bar_audio_path, load_bar_audio, upload_bar_audio
+    from eidolon.s3 import Bucket, S3Error, S3Settings
+
+    try:
+        catalog = load_bar_audio(bar_audio_path(args.characters or characters_path_from_env()))
+        settings = S3Settings.from_env(purpose="上传酒吧的音频")
+    except RuntimeError as e:  # a broken list, settings missing
+        print(e, file=sys.stderr)
+        return 1
+    if not args.audio.is_dir():
+        print(f"找不到原版提取目录里的音频目录 {args.audio}", file=sys.stderr)
+        return 1
+    bucket = Bucket(settings)
+    try:
+        report = await upload_bar_audio(args.audio, catalog, bucket)
+    except S3Error as e:
+        print(f"上传中断，没有写 manifest（已上传的不会重复上传，重新运行即可继续）：{e}", file=sys.stderr)
+        return 2
+    finally:
+        await bucket.aclose()
+    print(
+        f"上传 {report.uploaded} 个文件（{report.uploaded_bytes / 1_000_000:.1f} MB），"
+        f"{report.unchanged} 个存储桶里已有、内容没变，没有上传；写好了 bar/manifest.json"
+    )
+    if report.missing:
+        print(
+            f"{len(report.missing)} 个文件在 {args.audio} 里找不到，没有上传：{'、'.join(report.missing)}",
+            file=sys.stderr,
+        )
+        return 3
+    return 0
+
+
+async def _letter_music_upload(args: argparse.Namespace) -> int:
+    from eidolon.letter_music import (
+        PREFIX,
+        LetterMusicError,
+        letter_music_path,
+        load_letter_music,
+        upload_letter_music,
+    )
+    from eidolon.s3 import Bucket, S3Error, S3Settings
+
+    path = letter_music_path(args.characters or characters_path_from_env())
+    try:
+        music = load_letter_music(path)
+        if not music:
+            raise LetterMusicError(f"找不到信的配乐清单 {path}")
+        settings = S3Settings.from_env(purpose="上传信的配乐")
+    except RuntimeError as e:  # a broken list or none, settings missing
+        print(e, file=sys.stderr)
+        return 1
+    if not args.music.is_dir():
+        print(f"找不到配乐所在的目录 {args.music}", file=sys.stderr)
+        return 1
+    bucket = Bucket(settings)
+    try:
+        report = await upload_letter_music(args.music, music, bucket)
+    except S3Error as e:
+        print(f"上传中断（已上传的不会重复上传，重新运行即可继续）：{e}", file=sys.stderr)
+        return 2
+    finally:
+        await bucket.aclose()
+    print(
+        f"上传 {len(report.uploaded)} 首到 {PREFIX}（{report.uploaded_bytes / 1_000_000:.1f} MB），"
+        f"{report.unchanged} 首存储桶里已有、内容没变，没有上传"
+    )
+    if report.missing:
+        print(
+            f"{len(report.missing)} 个文件在 {args.music} 里找不到，没有上传：{'、'.join(report.missing)}",
+            file=sys.stderr,
+        )
+        return 3
     return 0
 
 
@@ -927,6 +1033,60 @@ async def _eval_memory(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _eval_moments(args: argparse.Namespace) -> int:
+    from eidolon.characters import load_characters
+    from eidolon.config import ImageSettings, LLMSettings
+    from eidolon.llm.providers import open_llm
+    from eidolon.moment_eval import (
+        MomentEvalError,
+        evaluate,
+        load_moment_eval,
+        render_html,
+        summary_line,
+    )
+    from eidolon.place_pool import PlacePoolError, load_place_pool, places_path
+    from eidolon.world import WorldError, load_world, world_path
+
+    if args.runs < 1:
+        print("--runs 至少是 1", file=sys.stderr)
+        return 1
+    try:
+        characters_path = args.characters or characters_path_from_env()
+        characters = load_characters(characters_path)
+        places = load_place_pool(places_path(characters_path), characters)
+        world = load_world(world_path(characters_path))
+        moment_eval = load_moment_eval(args.file, characters, places, world)
+    except (RuntimeError, MomentEvalError, PlacePoolError, WorldError) as e:
+        print(e, file=sys.stderr)
+        return 1
+    try:
+        chat = LLMSettings.chat_from_env()
+        image = ImageSettings.from_env()
+    except RuntimeError as e:
+        print(f"朋友圈评测要用部署者配置的对话模型：{e}", file=sys.stderr)
+        return 1
+    if args.model:
+        chat = replace(chat, model=args.model)
+    llm = open_llm(chat)
+    try:
+        results = await evaluate(
+            moment_eval, llm, args.runs, image.style if image is not None else "",
+            lambda case: print(case, file=sys.stderr, flush=True),
+        )
+    finally:
+        await llm.aclose()
+    try:
+        args.html.write_text(
+            render_html(results, chat.model, args.runs, datetime.now().astimezone()),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        print(f"写不了 {args.html}：{e}", file=sys.stderr)
+        return 1
+    print(f"{summary_line(results)}。结果在 {args.html}")
+    return 0
+
+
 async def _list_users(db: Database, _: argparse.Namespace) -> None:
     store = Store(db)
     users = await store.list_users()
@@ -975,6 +1135,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", metavar="命令")
     commands.add_parser("serve", help="启动服务（默认）")
+    doctor = commands.add_parser(
+        "doctor",
+        help="按 .env 逐项试一次各项服务（经代理和直连），说明哪里不对、该怎么改"
+        "（后端不用停，也不必在运行）",
+    )
+    doctor.add_argument("--json", action="store_true", help="结果输出成 JSON，给 Agent 读")
 
     user = commands.add_parser("user", help="管理用户").add_subparsers(
         dest="action", required=True, metavar="操作"
@@ -1115,6 +1281,38 @@ def _parser() -> argparse.ArgumentParser:
             "不要放进仓库",
         )
 
+    bar = commands.add_parser("bar", help="管理酒吧的音频").add_subparsers(
+        dest="action", required=True, metavar="操作"
+    )
+    bar_upload = bar.add_parser(
+        "upload",
+        help="按角色配置旁边的 bar_audio.json，把原版的曲目和音效从本机的原版提取目录上传到立绘的存储桶"
+        "（EIDOLON_STAND_S3_*）的 bar/ 下，内容没变的不重复上传，最后写 bar/manifest.json"
+        "（可重复执行；存储桶出错时退出码为 2，有找不到的文件时为 3）",
+    )
+    bar_upload.add_argument("audio", type=Path, help="本机原版提取目录里的 audio/，不要放进仓库")
+    bar_upload.add_argument(
+        "--characters",
+        type=Path,
+        help="角色配置文件（默认取环境变量 EIDOLON_CHARACTERS_PATH），曲目表和音效清单在它旁边",
+    )
+
+    letter_music = commands.add_parser("letter-music", help="管理信的配乐").add_subparsers(
+        dest="action", required=True, metavar="操作"
+    )
+    letter_music_upload = letter_music.add_parser(
+        "upload",
+        help="按角色配置旁边的 letter_music.toml，把目录里每个场合的配乐上传到立绘的存储桶"
+        "（EIDOLON_STAND_S3_*）的 letters/music/ 下，内容没变的不重复上传"
+        "（可重复执行；存储桶出错时退出码为 2，有找不到的文件时为 3）",
+    )
+    letter_music_upload.add_argument("music", type=Path, help="配乐所在的目录，不要放进仓库")
+    letter_music_upload.add_argument(
+        "--characters",
+        type=Path,
+        help="角色配置文件（默认取环境变量 EIDOLON_CHARACTERS_PATH），配乐清单在它旁边",
+    )
+
     reading = commands.add_parser("reading", help="管理读音").add_subparsers(
         dest="action", required=True, metavar="操作"
     )
@@ -1189,7 +1387,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     judge.add_argument(
         "--only",
-        choices=["retrieval", "emotion", "affinity", "photo"],
+        choices=["retrieval", "emotion", "affinity", "photo", "considerate"],
         action="append",
         help="只跑这一类用例（可以写几次，默认全跑），例如 --only photo",
     )
@@ -1218,6 +1416,26 @@ def _parser() -> argparse.ArgumentParser:
     )
     memory.add_argument(
         "--json", type=Path, help="把逐条结果和汇总写成 JSON 文件（基线就是这样提交的）"
+    )
+
+    moments = evaluation.add_parser(
+        "moments",
+        help="用朋友圈评测集的场景让对话模型逐个写动态和回复，连同配图清洗后的 tag 串写进 HTML，"
+        "格式坏了、超字数这类机器标出来，读起来怎样由人读（用部署者的对话模型，不真的生图）",
+    )
+    moments.add_argument("--html", type=Path, required=True, help="写成哪个 HTML 文件")
+    moments.add_argument(
+        "--file",
+        type=Path,
+        default=Path("eval/moments.toml"),
+        help="朋友圈评测集（默认 eval/moments.toml）",
+    )
+    moments.add_argument("--model", help="换一个对话模型（默认取环境变量 CHAT_LLM_MODEL）")
+    moments.add_argument("--runs", type=int, default=1, help="每个场景跑几遍（默认 1）")
+    moments.add_argument(
+        "--characters",
+        type=Path,
+        help="角色配置文件（默认取环境变量 EIDOLON_CHARACTERS_PATH）",
     )
 
     backup = commands.add_parser(

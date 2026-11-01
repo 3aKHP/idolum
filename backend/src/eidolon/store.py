@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
 from eidolon.affinity import Change
@@ -24,11 +24,15 @@ from eidolon.database import (
     tables,
 )
 from eidolon.delivery_cues import without_cues
-from eidolon.producer import Birthday, ProducerProfile
+from eidolon.producer import Birthday, City, ProducerProfile
 from eidolon.reply_format import Segment
 
+Admit = Callable[[sqlite3.Connection, str], None]
+"""Run in the write that makes a new user, given their id, to let them sign up: whatever it
+raises makes no one (`Store.create_user_signing_in_with`)."""
+
 Role = Literal["user", "character"]
-EventKind = Literal["hung_up", "gift", "ended"]
+EventKind = Literal["hung_up", "gift", "ended", "unwell"]
 PhotoStatus = Literal["pending", "ready", "failed"]
 """A photo being generated, sent, or not sent after all."""
 PhotoFailure = Literal["timeout", "service_error", "bad_image", "own_key_failed", "used_up"]
@@ -74,7 +78,14 @@ CREATE TABLE IF NOT EXISTS producer_profiles (
     timezone TEXT,
     updated_at TEXT NOT NULL,
     birthday_month INTEGER,
-    birthday_day INTEGER
+    birthday_day INTEGER,
+    -- Where the producer is, as QWeather found it (`producer.City`): NULL for nowhere set.
+    city_name TEXT,
+    city_adm2 TEXT,
+    city_adm1 TEXT,
+    city_country TEXT,
+    city_latitude REAL,
+    city_longitude REAL
 );
 -- `title` is its conversation title (`titles`), NULL until it is named, if ever.
 CREATE TABLE IF NOT EXISTS conversations (
@@ -89,7 +100,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE INDEX IF NOT EXISTS conversations_by_user
     ON conversations(user_id, character_id, created_at);
 -- `hurt` and `out_of_line`, on the user's message of a typed turn (`Typed`), are what the
--- turn took off her affinity and whether it was out of line; NULL for a turn of a call, or
+-- turn hurt her (`affinity.hurt`) and whether it was out of line; NULL for a turn of a call, or
 -- one recorded before typed turns were counted.
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,7 +123,9 @@ CREATE TABLE IF NOT EXISTS conversation_events (
     created_at TEXT NOT NULL,
     affinity TEXT,
     gift_id TEXT,
-    liked INTEGER NOT NULL DEFAULT 0
+    liked INTEGER NOT NULL DEFAULT 0,
+    first_day TEXT,
+    days_ago INTEGER
 );
 CREATE INDEX IF NOT EXISTS conversation_events_by_conversation
     ON conversation_events(conversation_id, created_at);
@@ -328,7 +341,7 @@ class Message:
 @dataclass(frozen=True)
 class Typed:
     """What a typed turn, one taken outside calls, comes to for her ending the conversation
-    (GLOSSARY.md「已结束的对话」): how much it took off her affinity (`affinity.hurt`), and
+    (GLOSSARY.md「已结束的对话」): how much it hurt her (`affinity.hurt`), and
     whether it was out of line."""
 
     hurt: float = 0.0
@@ -339,9 +352,11 @@ class Typed:
 class ConversationEvent:
     """Something that happened in a conversation that is not a turn (GLOSSARY.md「对话事件」):
     her hanging up on the user (`hung_up`), her ending the conversation (`ended`), after which
-    it can only be read, or the user giving her a gift (`gift`), which
+    it can only be read, the user giving her a gift (`gift`), which
     one (`gift_id`) and whether she liked it as it was given (`liked`), kept as it was
-    should what she likes change. It can carry how it changed her affinity (`affinity`)."""
+    should what she likes change, or her being unwell (`unwell`), for the user alone: from
+    the first day of her period (`first_day`, ISO), `days_ago` days before the day it was
+    recorded on. It can carry how it changed her affinity (`affinity`)."""
 
     id: int
     kind: EventKind
@@ -349,12 +364,16 @@ class ConversationEvent:
     affinity: Change | None = None
     gift_id: str | None = None
     liked: bool = False
+    first_day: str | None = None
+    days_ago: int | None = None
     type: Literal["event"] = field(default="event", init=False)
 
     def shown(self) -> dict:
         """As the browser is told it: whether she liked the gift is for her prompt alone;
-        which gift, for a gift's only."""
-        hidden = {"liked"} | ({"gift_id"} if self.gift_id is None else set())
+        which gift, for a gift's only; since when she is unwell, for her being unwell's."""
+        hidden = {"liked"} | ({"gift_id"} if self.gift_id is None else set()) | (
+            {"first_day", "days_ago"} if self.kind != "unwell" else set()
+        )
         return {k: v for k, v in asdict(self).items() if k not in hidden}
 
 
@@ -395,6 +414,12 @@ Recorded = Message | ConversationEvent | ReachOut
 """What a conversation's record holds."""
 
 
+def told_her(entry: Recorded) -> bool:
+    """Whether she is told of the entry in her prompts: of all but her being unwell, which
+    she knows herself, and which is for the user alone."""
+    return not (isinstance(entry, ConversationEvent) and entry.kind == "unwell")
+
+
 @dataclass(frozen=True)
 class CurrentConversation:
     """Her current conversation with a user (GLOSSARY.md「当前对话」) as reach-outs go by it:
@@ -407,6 +432,18 @@ class CurrentConversation:
     last_contact: datetime | None
     reached_out_at: datetime | None
     ended: bool
+
+
+@dataclass(frozen=True)
+class InTouch:
+    """How a user and a character are in touch, over all their conversations, as moments go
+    by it (GLOSSARY.md「朋友圈」): whether they have had a turn; when they were last in touch
+    (`read_last_contact`; None before either)."""
+
+    user_id: str
+    character_id: str
+    has_turns: bool
+    last_contact: datetime | None
 
 
 @dataclass(frozen=True)
@@ -471,6 +508,8 @@ class KeptEvent:
     affinity: Change | None
     gift_id: str | None
     liked: bool
+    first_day: str | None = None
+    days_ago: int | None = None
 
 
 @dataclass(frozen=True)
@@ -577,12 +616,17 @@ class Store:
         """The id of the user this identity belongs to, if any."""
         return await self._db.read(_user_signing_in_with, provider, subject)
 
-    async def create_user_signing_in_with(self, name: str, method: SignInMethod) -> User:
-        """A new user, whose one sign-in method is `method`. Raises IdentityTaken, making
-        no one, if the identity already belongs to someone."""
+    async def create_user_signing_in_with(
+        self,
+        name: str,
+        method: SignInMethod,
+        admit: Admit | None = None,
+    ) -> User:
+        """A new user, whose one sign-in method is `method`, let sign up by `admit` if given.
+        Raises IdentityTaken, making no one, if the identity already belongs to someone."""
         user = User(uuid.uuid4().hex, name, _now())
         try:
-            await self._db.write(_insert_user_signing_in_with, user, method)
+            await self._db.write(_insert_user_signing_in_with, user, method, admit)
         except sqlite3.IntegrityError:
             raise IdentityTaken from None
         return user
@@ -737,6 +781,18 @@ class Store:
         is none such."""
         return await self._db.read(_photo_image, photo_id, user_id)
 
+    async def reply_said(self, conversation_id: str, message_id: int) -> list[Segment] | None:
+        """The segments of her reply `message_id`, as the model wrote them, delivery cues and
+        all; None unless it is a reply of hers in the conversation."""
+        return await self._db.read(_reply_said, conversation_id, message_id)
+
+    async def reach_out_said(
+        self, conversation_id: str, reach_out_id: int
+    ) -> list[Segment] | None:
+        """The segments of her reach-out `reach_out_id`, as the model wrote them; None unless
+        it is one in the conversation."""
+        return await self._db.read(_reach_out_said, conversation_id, reach_out_id)
+
     async def hang_up(self, conversation_id: str) -> ConversationEvent:
         """Record that she hung up on the user in the conversation, now (`hung_up`), unless
         she has ended it: then nothing more is recorded, and it is her ending it that is
@@ -823,7 +879,7 @@ _MESSAGE_WITH_PHOTO = (
     " FROM messages m LEFT JOIN photos p ON p.message_id = m.id"
 )
 """A message with its photo, if any, but not its picture (`_message_with_photo`)."""
-_EVENT_COLUMNS = "id, kind, created_at, affinity, gift_id, liked"
+_EVENT_COLUMNS = "id, kind, created_at, affinity, gift_id, liked, first_day, days_ago"
 _REACH_OUT_COLUMNS = "id, ja, zh, segments, created_at"
 
 def _open(db: sqlite3.Connection) -> None:
@@ -836,12 +892,18 @@ def _open(db: sqlite3.Connection) -> None:
         db.execute("UPDATE users SET name = id")
     _add_missing_columns(db, "users", ("consented_at", "banned_at", "ban_note"), "TEXT")
     _add_missing_columns(db, "producer_profiles", ("birthday_month", "birthday_day"), "INTEGER")
+    _add_missing_columns(
+        db, "producer_profiles", ("city_name", "city_adm2", "city_adm1", "city_country"), "TEXT"
+    )
+    _add_missing_columns(db, "producer_profiles", ("city_latitude", "city_longitude"), "REAL")
     _add_missing_columns(db, "messages", ("affinity",), "TEXT")
     _add_missing_columns(db, "messages", ("hurt",), "REAL")
     _add_missing_columns(db, "messages", ("out_of_line",), "INTEGER")
     _add_missing_columns(db, "conversations", ("title",), "TEXT")
     _add_missing_columns(db, "conversation_events", ("gift_id",), "TEXT")
     _add_missing_columns(db, "conversation_events", ("liked",), "INTEGER NOT NULL DEFAULT 0")
+    _add_missing_columns(db, "conversation_events", ("first_day",), "TEXT")
+    _add_missing_columns(db, "conversation_events", ("days_ago",), "INTEGER")
     # Whether she has responded to an event is whether she has replied since; never kept.
     if "responded" in _columns(db, "conversation_events"):
         db.execute("ALTER TABLE conversation_events DROP COLUMN responded")
@@ -970,10 +1032,15 @@ def _user_signing_in_with(db: sqlite3.Connection, provider: str, subject: str) -
 
 
 def _insert_user_signing_in_with(
-    db: sqlite3.Connection, user: User, method: SignInMethod
+    db: sqlite3.Connection,
+    user: User,
+    method: SignInMethod,
+    admit: Admit | None,
 ) -> None:
     _insert_user(db, user)
     _insert_sign_in_method(db, user.id, method)
+    if admit is not None:
+        admit(db, user.id)
 
 
 def _insert_sign_in_method(db: sqlite3.Connection, user_id: str, method: SignInMethod) -> None:
@@ -1107,7 +1174,8 @@ def read_profile(db: sqlite3.Connection, user_id: str) -> ProducerProfile:
     """The user's producer profile, read through `db`: what `Store.get_profile` reads, and
     what other modules read in their own transactions; all defaults until they save one."""
     row = by_name(db).execute(
-        "SELECT form_of_address, gender, timezone, birthday_month, birthday_day"
+        "SELECT form_of_address, gender, timezone, birthday_month, birthday_day, city_name,"
+        " city_adm2, city_adm1, city_country, city_latitude, city_longitude"
         " FROM producer_profiles WHERE user_id = ?",
         (user_id,),
     ).fetchone()
@@ -1118,20 +1186,35 @@ def read_profile(db: sqlite3.Connection, user_id: str) -> ProducerProfile:
         if row["birthday_month"] is not None and row["birthday_day"] is not None
         else None
     )
-    return ProducerProfile(row["form_of_address"], row["gender"], row["timezone"], birthday)
+    city = (
+        City(
+            row["city_name"], row["city_adm2"] or "", row["city_adm1"] or "",
+            row["city_country"] or "", row["city_latitude"], row["city_longitude"],
+        )
+        if row["city_name"] is not None and row["city_latitude"] is not None
+        and row["city_longitude"] is not None
+        else None
+    )
+    return ProducerProfile(
+        row["form_of_address"], row["gender"], row["timezone"], birthday, city
+    )
 
 
 def write_profile(db: sqlite3.Connection, user_id: str, profile: ProducerProfile) -> None:
     """Save the user's whole producer profile through `db`, in the caller's transaction: what
     `Store.save_profile` does, and importing a data package in its write task."""
-    birthday = profile.birthday
+    birthday, city = profile.birthday, profile.city
     db.execute(
         "INSERT INTO producer_profiles"
         " (user_id, form_of_address, gender, timezone, birthday_month, birthday_day,"
-        " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        " city_name, city_adm2, city_adm1, city_country, city_latitude, city_longitude,"
+        " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT (user_id) DO UPDATE SET form_of_address = excluded.form_of_address,"
         " gender = excluded.gender, timezone = excluded.timezone,"
         " birthday_month = excluded.birthday_month, birthday_day = excluded.birthday_day,"
+        " city_name = excluded.city_name, city_adm2 = excluded.city_adm2,"
+        " city_adm1 = excluded.city_adm1, city_country = excluded.city_country,"
+        " city_latitude = excluded.city_latitude, city_longitude = excluded.city_longitude,"
         " updated_at = excluded.updated_at",
         (
             user_id,
@@ -1140,6 +1223,12 @@ def write_profile(db: sqlite3.Connection, user_id: str, profile: ProducerProfile
             profile.timezone,
             birthday and birthday.month,
             birthday and birthday.day,
+            city and city.name,
+            city and city.adm2,
+            city and city.adm1,
+            city and city.country,
+            city and city.latitude,
+            city and city.longitude,
             _now(),
         ),
     )
@@ -1228,7 +1317,7 @@ def read_whole_conversations(db: sqlite3.Connection, user_id: str) -> list[Whole
             [
                 KeptEvent(
                     e["kind"], e["created_at"], _change(e["affinity"]), e["gift_id"],
-                    bool(e["liked"]),
+                    bool(e["liked"]), e["first_day"], e["days_ago"],
                 )
                 for e in named.execute(
                     f"SELECT {_EVENT_COLUMNS} FROM conversation_events"
@@ -1455,6 +1544,26 @@ def _photo_image(db: sqlite3.Connection, photo_id: str, user_id: str) -> bytes |
     return row[0] if row else None
 
 
+def _reply_said(
+    db: sqlite3.Connection, conversation_id: str, message_id: int
+) -> list[Segment] | None:
+    row = db.execute(
+        "SELECT segments FROM messages WHERE id = ? AND conversation_id = ? AND role = 'character'",
+        (message_id, conversation_id),
+    ).fetchone()
+    return [Segment(**s) for s in json.loads(row[0] or "[]")] if row else None
+
+
+def _reach_out_said(
+    db: sqlite3.Connection, conversation_id: str, reach_out_id: int
+) -> list[Segment] | None:
+    row = db.execute(
+        "SELECT segments FROM reach_outs WHERE id = ? AND conversation_id = ?",
+        (reach_out_id, conversation_id),
+    ).fetchone()
+    return [Segment(**s) for s in json.loads(row[0])] if row else None
+
+
 def add_gift(
     db: sqlite3.Connection,
     user_id: str,
@@ -1476,6 +1585,31 @@ def add_gift(
         _insert_conversation(db, conversation)
     _insert_event(db, conversation.id, "gift", _now(), affinity, gift_id, liked)
     return conversation
+
+
+def add_unwell(
+    db: sqlite3.Connection, conversation: Conversation, first_day: date, days_ago: int,
+    said_at: str,
+) -> ConversationEvent | None:
+    """Record her being unwell in the conversation, from `first_day`, `days_ago` days before
+    today, just before the user's words said at `said_at`, so that it comes before their
+    turn; through `db`, in the transaction the turn is recorded in, before it. Once a period:
+    nothing if one from `first_day` is in any of the user's conversations with her already,
+    which is None."""
+    recorded = db.execute(
+        "SELECT EXISTS (SELECT 1 FROM conversation_events e"
+        " JOIN conversations c ON c.id = e.conversation_id"
+        " WHERE c.user_id = ? AND c.character_id = ? AND e.kind = 'unwell'"
+        " AND e.first_day = ?)",
+        (conversation.user_id, conversation.character_id, first_day.isoformat()),
+    ).fetchone()[0]
+    if recorded:
+        return None
+    before = (_at(said_at) - timedelta(microseconds=1)).isoformat()
+    return _insert_event(
+        db, conversation.id, "unwell", before, first_day=first_day.isoformat(),
+        days_ago=days_ago,
+    )
 
 
 def _hang_up(db: sqlite3.Connection, conversation_id: str) -> ConversationEvent:
@@ -1598,17 +1732,61 @@ def _current_conversations(db: sqlite3.Connection) -> list[CurrentConversation]:
     ]
 
 
-def read_last_contact(
+def read_in_touch(db: sqlite3.Connection, user_id: str | None = None) -> list[InTouch]:
+    """How every user, but banned users, or only `user_id` if not banned, is in touch with
+    each character they have a conversation with, read through `db`; in no order."""
+    only = " AND c.user_id = :user" if user_id is not None else ""
+    users = f"JOIN users u ON u.id = c.user_id AND u.banned_at IS NULL{only}"
+    turns = db.execute(
+        "SELECT c.user_id, c.character_id, MAX(m.created_at) FROM conversations c"
+        f" {users} LEFT JOIN messages m ON m.conversation_id = c.id"
+        " GROUP BY c.user_id, c.character_id",
+        {"user": user_id},
+    ).fetchall()
+    calls: dict[tuple[str, str], list[tuple[str, float]]] = {}
+    for user, character, connected_at, duration_s in db.execute(
+        "SELECT c.user_id, c.character_id, k.connected_at, k.duration_s FROM calls k"
+        f" JOIN conversations c ON c.id = k.conversation_id {users}",
+        {"user": user_id},
+    ):
+        calls.setdefault((user, character), []).append((connected_at, duration_s))
+    return [
+        InTouch(user, character, last_turn is not None,
+                _last_contact(last_turn, calls.get((user, character), [])))
+        for user, character, last_turn in turns
+    ]
+
+
+def read_current_conversation(
     db: sqlite3.Connection, user_id: str, character_id: str
+) -> Conversation | None:
+    """The user's current conversation with the character (GLOSSARY.md「当前对话」), read
+    through `db`; None without one."""
+    row = by_name(db).execute(
+        f"SELECT c.* FROM conversations c WHERE c.user_id = ? AND c.character_id = ?"
+        f" AND {_CURRENT}",
+        (user_id, character_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return Conversation(
+        row["id"], row["user_id"], row["character_id"], row["created_at"], row["title"]
+    )
+
+
+def read_last_contact(
+    db: sqlite3.Connection, user_id: str, character_id: str, before: datetime | None = None
 ) -> datetime | None:
     """When the user and the character were last in touch, in any of their conversations,
     read through `db`: her last turn recorded, or a call that connected ending, whichever
-    was later; None before either."""
+    was later, and earlier than `before` if given; None before either."""
+    until = () if before is None else (before.astimezone(UTC).isoformat(),)
     [last_turn] = db.execute(
         "SELECT MAX(m.created_at) FROM messages m"
         " JOIN conversations c ON c.id = m.conversation_id"
-        " WHERE c.user_id = ? AND c.character_id = ?",
-        (user_id, character_id),
+        " WHERE c.user_id = ? AND c.character_id = ?"
+        + ("" if before is None else " AND m.created_at < ?"),
+        (user_id, character_id, *until),
     ).fetchone()
     calls = db.execute(
         "SELECT k.connected_at, k.duration_s FROM calls k"
@@ -1616,6 +1794,8 @@ def read_last_contact(
         " WHERE c.user_id = ? AND c.character_id = ?",
         (user_id, character_id),
     ).fetchall()
+    if before is not None:
+        calls = [call for call in calls if _call_ended(*call) < before]
     return _last_contact(last_turn, calls)
 
 
@@ -1737,16 +1917,19 @@ def _insert_event(
     affinity: Change | None = None,
     gift_id: str | None = None,
     liked: bool = False,
+    first_day: str | None = None,
+    days_ago: int | None = None,
 ) -> ConversationEvent:
     cursor = db.execute(
         "INSERT INTO conversation_events"
-        " (conversation_id, kind, created_at, affinity, gift_id, liked)"
-        " VALUES (?, ?, ?, ?, ?, ?)",
-        (conversation_id, kind, created_at, _stored_change(affinity), gift_id, int(liked)),
+        " (conversation_id, kind, created_at, affinity, gift_id, liked, first_day, days_ago)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (conversation_id, kind, created_at, _stored_change(affinity), gift_id, int(liked),
+         first_day, days_ago),
     )
     assert cursor.lastrowid is not None
     return ConversationEvent(
-        cursor.lastrowid, kind, created_at, affinity, gift_id=gift_id, liked=liked
+        cursor.lastrowid, kind, created_at, affinity, gift_id, liked, first_day, days_ago
     )
 
 
@@ -1801,11 +1984,11 @@ def add_carried_conversation(
             )
     db.executemany(
         "INSERT INTO conversation_events"
-        " (conversation_id, kind, created_at, affinity, gift_id, liked)"
-        " VALUES (?, ?, ?, ?, ?, ?)",
+        " (conversation_id, kind, created_at, affinity, gift_id, liked, first_day, days_ago)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (conversation_id, e.kind, e.created_at, _stored_change(e.affinity), e.gift_id,
-             int(e.liked))
+             int(e.liked), e.first_day, e.days_ago)
             for e in conversation.events
         ],
     )
@@ -1858,7 +2041,7 @@ def _message_with_photo(row: sqlite3.Row) -> Message:
 def _event(row: sqlite3.Row) -> ConversationEvent:
     return ConversationEvent(
         row["id"], row["kind"], row["created_at"], _change(row["affinity"]),
-        row["gift_id"], bool(row["liked"]),
+        row["gift_id"], bool(row["liked"]), row["first_day"], row["days_ago"],
     )
 
 

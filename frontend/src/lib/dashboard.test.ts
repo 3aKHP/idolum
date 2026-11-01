@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   achievementTiles,
+  barTiles,
   affinityRows,
   countTicks,
-  dailyTaskTiles,
   durationRange,
   formatCount,
   formatCacheHitRate,
@@ -24,8 +24,12 @@ import {
   dashboardHref,
   dashboardTabs,
   labelledStretches,
+  letterTiles,
+  momentTiles,
   rangeFromQuery,
   reachOutTiles,
+  scheduleTiles,
+  cycleTiles,
   splitZeroRows,
   stretchLabel,
   stretchSpan,
@@ -288,6 +292,19 @@ describe("affinityRows", () => {
   });
 });
 
+describe("letterTiles", () => {
+  it("are none where the section is empty", () => {
+    expect(letterTiles(null)).toEqual([]);
+  });
+
+  it("count the letters written and the times writing one failed", () => {
+    expect(letterTiles({ succeeded: 1200, failed: 3 }).map((tile) => [tile.label, tile.value])).toEqual([
+      ["写了", "1,200"],
+      ["失败", "3"],
+    ]);
+  });
+});
+
 describe("reachOutTiles", () => {
   it("are none where the section is empty", () => {
     expect(reachOutTiles(null)).toEqual([]);
@@ -303,23 +320,61 @@ describe("reachOutTiles", () => {
   });
 });
 
-describe("foldedCount", () => {
-  it("shows the first five of a long list, and all of a list that would hide just one", () => {
-    expect([6, 7].map(foldedCount)).toEqual([6, 5]);
+describe("momentTiles", () => {
+  it("are none where the section is empty", () => {
+    expect(momentTiles(null)).toEqual([]);
+  });
+
+  it("count the moments posted and failed, the replies and failed, and tell the share liked or commented on, a dash of none", () => {
+    const section = { posted: 1200, posts_failed: 3, replied: 40, replies_failed: 2, liked_or_commented_share: 0.25 };
+    expect(momentTiles(section).map((tile) => [tile.label, tile.value])).toEqual([
+      ["发了", "1,200"],
+      ["发失败", "3"],
+      ["回评论", "40"],
+      ["回失败", "2"],
+      ["近 30 天制作人赞或评论过", "25%"],
+    ]);
+    expect(momentTiles({ ...section, liked_or_commented_share: null })[4].value).toBe("—");
   });
 });
 
-describe("dailyTaskTiles", () => {
+describe("barTiles", () => {
   it("are none where the section is empty", () => {
-    expect(dailyTaskTiles(null)).toEqual([]);
+    expect(barTiles(null)).toEqual([]);
   });
 
-  it("count each task done, in the order of the gifts page", () => {
-    expect(dailyTaskTiles({ one_turn: 1200, one_gift: 3, ten_turns: 0 }).map((tile) => [tile.label, tile.value])).toEqual([
-      ["一个回合", "1,200"],
-      ["送一件礼", "3"],
-      ["十个回合", "0"],
+  it("count the visits begun, done and failed", () => {
+    expect(barTiles({ visits: 1200, done: 800, failed: 3 }).map((tile) => [tile.label, tile.value])).toEqual([
+      ["光顾", "1,200"],
+      ["玩完", "800"],
+      ["失败", "3"],
     ]);
+  });
+});
+
+describe("scheduleTiles", () => {
+  it("are none where schedules are off", () => {
+    expect(scheduleTiles(null)).toEqual([]);
+  });
+
+  it("count the users who saved a schedule this week", () => {
+    expect(scheduleTiles(1234).map((tile) => [tile.label, tile.value])).toEqual([["本周排了日程的人数", "1,234"]]);
+  });
+});
+
+describe("cycleTiles", () => {
+  it("are none where cycles are off", () => {
+    expect(cycleTiles(null)).toEqual([]);
+  });
+
+  it("count the users who wrote down any period", () => {
+    expect(cycleTiles(1234).map((tile) => [tile.label, tile.value])).toEqual([["记过周期的用户数", "1,234"]]);
+  });
+});
+
+describe("foldedCount", () => {
+  it("shows the first five of a long list, and all of a list that would hide just one", () => {
+    expect([6, 7].map(foldedCount)).toEqual([6, 5]);
   });
 });
 
@@ -339,14 +394,27 @@ describe("achievementTiles", () => {
 
 describe("dashboardTabs", () => {
   const affinity = { cooldowns: 0, cooled_users: 0, out_of_line: 0, manipulation: 0, levels: [0, 0, 0, 0, 0], characters: [] };
-  const tasks = { one_turn: 0, one_gift: 0, ten_turns: 0 };
+  const achievements = { stages: 0, draws: 0, reset_cards: 0 };
+  const WITH = ["overview", "usage", "affinity", "cost"];
 
-  it("have「好感度」where affinity is on, or daily tasks were done in the range", () => {
-    expect(dashboardTabs({ affinity, daily_tasks: tasks })).toEqual(["overview", "usage", "affinity", "cost"]);
-    expect(dashboardTabs({ affinity: null, daily_tasks: tasks })).toEqual(["overview", "usage", "affinity", "cost"]);
+  it("have「好感度」where affinity is on, or achievements were unlocked in the range while it was", () => {
+    expect(dashboardTabs({ affinity, achievements, scheduled_this_week: null, recorded_cycles: null })).toEqual(WITH);
+    expect(dashboardTabs({ affinity: null, achievements, scheduled_this_week: null, recorded_cycles: null })).toEqual(WITH);
   });
 
-  it("have none where both are empty", () => {
-    expect(dashboardTabs({ affinity: null, daily_tasks: null })).toEqual(["overview", "usage", "cost"]);
+  it("have「好感度」where affinity is off and schedules are on, for their tile", () => {
+    expect(dashboardTabs({ affinity: null, achievements: null, scheduled_this_week: 0, recorded_cycles: null })).toEqual(WITH);
+  });
+
+  it("have「好感度」where affinity is off and cycles are on, for their tile", () => {
+    expect(dashboardTabs({ affinity: null, achievements: null, scheduled_this_week: null, recorded_cycles: 0 })).toEqual(WITH);
+  });
+
+  it("have none where all are empty", () => {
+    expect(dashboardTabs({ affinity: null, achievements: null, scheduled_this_week: null, recorded_cycles: null })).toEqual([
+      "overview",
+      "usage",
+      "cost",
+    ]);
   });
 });

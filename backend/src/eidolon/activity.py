@@ -1,10 +1,13 @@
-"""Activity records (GLOSSARY.md「运行记录」): one for each turn, each call and each
-reach-out (GLOSSARY.md「搭话」), saying how it turned out, and one for each call to an
-outside service, saying which service, whose key, whether it failed and how, how long it
-took and what it was billed for; an LLM's, also how much of its input hit the provider's
-prompt cache, how soon its first word came and the reasoning effort it was asked for. They
-hold nothing anyone said. Only the admin console reads them: its dashboard (`dashboard`), and its users page, for each user's
-recent usage (`admin_users_api`).
+"""Activity records (GLOSSARY.md「运行记录」): one for each turn, each call, each reach-out
+(GLOSSARY.md「搭话」), each visit to the bar (GLOSSARY.md「光顾」), each moment she posts
+(GLOSSARY.md「朋友圈」) and each letter she writes (GLOSSARY.md「信」), saying how it turned
+out, and
+one for each call to an outside service, saying which service, whose key, whether it failed
+and how, how long it took and what it was billed for; an LLM's, also how much of its input
+hit the provider's prompt cache, how soon its first word came and the reasoning effort it
+was asked for. They hold nothing anyone said. Only the admin console reads them: its
+dashboard (`dashboard`), and its users page, for each user's recent usage
+(`admin_users_api`).
 
 A turn's record is open while the turn runs (`ActivityLog.begin`, then `current`), and the
 service calls made meanwhile, in the turn's context, are recorded under it; its outcome
@@ -18,17 +21,24 @@ with how long it lasted and why it ended. The turns taken in it each have a reco
 their own under the call's (`Recording.turn`), written with it; its speech recognition,
 synthesis and emotion judging are recorded under the call (`Recording.add`), not a turn.
 
+A visit's record is open while the visit is under way, over as many requests as it has
+calls: the service calls of each, and of rewriting her order, are recorded under it
+(`Recording.current`, in each). It is written as the visit is over, as its use of the limit
+is settled (`admission`): done, left or done away with, failed, or rejected over the limit.
+It keeps whether the LLM that wrote it was the user's own, as a turn's does; never what was
+said, nor how each drink was judged.
+
 A reach-out's record says whether the user answered it: had a turn, or a call that connected,
 in its conversation after it and before the next. The store marks it so as it records the
 turn or keeps the call (`store.add_turn`, `store.keep_call`), by the record its reach-out
 names; or as that is kept, should they have been in touch since (`Store.reach_out_recorded_as`).
 
-A daily task done (GLOSSARY.md「每日任务」) has a record of its own, with no character and
-which task in its result (`ActivityLog.daily_task_done`): no turn nor call, nor counted as
-one anywhere. So has an achievement's stage unlocked (GLOSSARY.md「成就」), with the
+An achievement's stage unlocked (GLOSSARY.md「成就」) has a record of its own, with the
 character it is hers of (none for those of all the characters together) and which stage of
-which achievement in its result, and a character complete, with `COMPLETE` in its result
-(`ActivityLog.achievement_unlocked`, `ActivityLog.character_complete`).
+which achievement in its result, and so has a character complete, with `COMPLETE` in its
+result (`ActivityLog.achievement_unlocked`, `ActivityLog.character_complete`): no turn nor
+call, nor counted as one anywhere. Daily tasks done had records too, until they were retired
+(`_forget_daily_tasks`).
 
 A photo she sends (`photos`) is generated in the context of the turn it was begun in, and
 often comes out after the turn is over: its request to the image service is recorded under
@@ -78,7 +88,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from eidolon.affinity import EndsFor, Judged
+from eidolon.affinity import Days, EndsFor, Judged
 from eidolon.billing import Billing, billing
 from eidolon.characters import Character
 from eidolon.clock import Clock
@@ -114,16 +124,25 @@ LLM_SERVICES: tuple[ServiceName, ...] = ("chat_llm", "memory_llm")
 """The LLMs among them (`llm_origin`): a user's own is recorded as `OWN`, and each call
 says how soon its first word came and at which reasoning effort."""
 
-RecordKind = Literal["turn", "call", "reach_out", "daily_task", "achievement"]
+RecordKind = Literal[
+    "turn", "call", "reach_out", "achievement", "visit", "moment", "moment_reply", "letter"
+]
 """A reach-out is neither a turn nor a call, nor counted as one anywhere; it is always on the
-deployer's keys. Nor is a daily task done, which has no character and no service calls, nor
-an achievement's stage unlocked or a character complete, which have none either."""
+deployer's keys, as a moment is, and her reply to the producer's comment on one
+(`moment_reply`), and neither is either; nor is a letter she writes (`letter`). Nor is an
+achievement's stage unlocked or a character complete, which has no service calls; nor a
+visit to the bar."""
+OWN_LLM_KINDS: frozenset[RecordKind] = frozenset({"turn", "visit"})
+"""The kinds whose record keeps, as being on the user's own keys, whether its LLM was the
+user's own; the others keep whether they were exempt."""
 Result = Literal["success", "failed", "rejected", "left", "not_connected"]
 """How a turn or call turned out (GLOSSARY.md「回合」「接通」): a turn succeeded, failed on
 a service, was rejected (over the limit, or its input), or the user left before it was
-done; a call also may never have connected. A reach-out succeeds or fails. A daily task
-done has which task it was (`happenings.DAILY_TASKS`) instead; an achievement's record, which
-stage of which (`stage_unlocked`), or `COMPLETE`."""
+done; a call also may never have connected. A reach-out, a moment or a letter succeeds or fails; a
+reply to the producer's comment too, or is rejected, the comment deleted as it was made. A visit is done
+(success), failed on the call it was over at, was rejected over the limit, or else was
+left. An achievement's
+record has which stage of which instead (`stage_unlocked`), or `COMPLETE`."""
 RESULTS: tuple[Result, ...] = ("success", "failed", "rejected", "left", "not_connected")
 
 COMPLETE = "complete"
@@ -153,7 +172,7 @@ these, and sorts the users by them (`Store.find_users`)."""
 
 TURNS_AND_CALLS = "kind IN ('turn', 'call')"
 """Which records, in SQL over `activity_records`, are of turns and calls: not of reach-outs,
-which the user did not take, nor of daily tasks done or achievements."""
+which the user did not take, nor of achievements, nor of visits."""
 
 JUDGEMENT_COLUMNS = ("affinity_level", "out_of_line", "manipulation", "cooled")
 """What a turn's record keeps of how the judge model judged it, as its columns are named."""
@@ -166,8 +185,8 @@ _SCHEMA = """
 -- NULL once the user is deleted, and `anonymous_id` then tells their records apart from
 -- other users' without saying whose they were. `call_id`, `duration_s` and `end_reason`
 -- are for calls: a call's turns name its record in `call_id`, and a call has the other two.
--- `own_keys` is, for a turn, whether its LLM was the user's own; for a call, whether all
--- of its LLM, speech recognition and synthesis were (GLOSSARY.md「运行记录」). The last four
+-- `own_keys` is, for a turn or a visit, whether its LLM was the user's own; for a call,
+-- whether all of its LLM, speech recognition and synthesis were (GLOSSARY.md「运行记录」). The last four
 -- are what the judge model made of a turn recorded (GLOSSARY.md「好感度」): its level, 0–4,
 -- whether out of line, whether it tried to dictate her affinity, and whether the turn began
 -- a cooldown; all NULL for a turn not judged, or not recorded. `ended_conversation` is why
@@ -175,7 +194,10 @@ _SCHEMA = """
 -- `answered` is whether a reach-out was answered (GLOSSARY.md「搭话」): the user had a turn,
 -- or a call connected, in its conversation after it and before the next; the store marks it
 -- so, by the record its reach-out keeps (`store.add_turn`, `store.keep_call`,
--- `Store.reach_out_recorded_as`). 0 for others.
+-- `Store.reach_out_recorded_as`). 0 for others. `degraded` is a moment's or a letter's alone:
+-- which parts of what she wrote were left out or made do without, and how many of each, as a
+-- JSON object (`{"comments": 1}`; a letter's, `{"voice": 1}` for one not read aloud); NULL
+-- where none were.
 CREATE TABLE IF NOT EXISTS activity_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,
@@ -194,7 +216,8 @@ CREATE TABLE IF NOT EXISTS activity_records (
     manipulation INTEGER,
     cooled INTEGER,
     ended_conversation TEXT,
-    answered INTEGER NOT NULL DEFAULT 0
+    answered INTEGER NOT NULL DEFAULT 0,
+    degraded TEXT
 );
 CREATE INDEX IF NOT EXISTS activity_records_by_time ON activity_records(started_at);
 CREATE INDEX IF NOT EXISTS activity_records_by_user ON activity_records(user_id, started_at);
@@ -403,8 +426,8 @@ class RecordRow:
     started_at: datetime
     result: Result
     own_llm: bool | None
-    """For a turn (one in a call too), whether the character's LLM was the user's own;
-    None for a call (GLOSSARY.md「运行记录」)."""
+    """For a turn (one in a call too) or a visit, whether the character's LLM was the user's
+    own; None for a call (GLOSSARY.md「运行记录」)."""
     exempt: bool | None
     """For a call, whether it brought the user's own keys for every one of the exempting
     keys (GLOSSARY.md「免限额密钥」), so that it counted towards no limit; None for a turn
@@ -430,8 +453,8 @@ class RecordRow:
     @property
     def own_keys(self) -> bool:
         """Whether the record counts as on the user's own keys, as the dashboard and the
-        admin's users page show it: a turn's own LLM, a call's being exempt."""
-        return bool(self.own_llm if self.kind == "turn" else self.exempt)
+        admin's users page show it: a turn's or visit's own LLM, a call's being exempt."""
+        return bool(self.own_llm if self.kind in OWN_LLM_KINDS else self.exempt)
 
 
 @dataclass(frozen=True)
@@ -480,10 +503,10 @@ class RecordGroup:
     kind: RecordKind
     character_id: str
     result: Result | str
-    """How it turned out; for a daily task done, which task; for an achievement, which
-    stage, or `COMPLETE`."""
+    """How it turned out; for an achievement, which stage, or `COMPLETE`."""
     own_keys: bool
-    """`RecordRow.own_keys`: for a turn, its own LLM; for a call, its being exempt."""
+    """`RecordRow.own_keys`: for a turn or visit, its own LLM; for a call, its being
+    exempt."""
     in_call: bool
     end_reason: CallEndReason | None
     judged: Judged | None
@@ -612,13 +635,15 @@ class Recording:
         self.calls: list[ServiceCall] = []
         self.finished = False
         self.result: Result | str | None = None
-        """How it turned out; for a daily task done, which task; for an achievement, which
-        stage, or `COMPLETE`."""
+        """How it turned out; for an achievement, which stage, or `COMPLETE`."""
         self.duration_s: float | None = None
         self.end_reason: CallEndReason | None = None
         self.judged_as: Judged | None = None
         self.cooled = False
         self.ended_conversation: EndsFor | None = None
+        self.degraded: dict[str, int] | None = None
+        """For a moment or a letter, which parts of what she wrote were made do without, and
+        how many of each; None where none were."""
         self.call = call
         """The call this turn was taken in, if any."""
         self.turns: list[Recording] = []
@@ -673,7 +698,7 @@ class Recording:
         end_reason: CallEndReason | None = None,
     ) -> None:
         """Write the record, as `result` (a call's with how long it lasted and why it
-        ended; a daily task done's, which task), with its service calls; only the first
+        ended; an achievement's, which stage of which), with its service calls; only the first
         time. A turn in a call is written with the call, or at once if the call's record has
         been handed in already. Writing it failing is only logged."""
         if self.finished:
@@ -722,22 +747,18 @@ class ActivityLog:
         for table in ("taken_rollups", "call_rollups"):
             await in_batches(self._db, _forget_rollups_before, table, None, at - SLOT)
 
-    async def daily_task_done(self, user_id: str, task_id: str, at: datetime) -> None:
-        """The user did the daily task `at`: recorded, with no character, as a write task of
-        its own; failing, only logged."""
-        await Recording(self, "daily_task", user_id, "", at, False, False).finish(task_id)
-
     async def achievement_unlocked(
         self, user_id: str, character_id: str | None, achievement: str, stage: int, at: datetime
     ) -> None:
         """The user unlocked the achievement's `stage` `at`: recorded, with the character it is
-        hers of, or none for those of all the characters together, as `daily_task_done` is."""
+        hers of, or none for those of all the characters together, as a write task of its own;
+        failing, only logged."""
         await Recording(
             self, "achievement", user_id, character_id or "", at, False, False
         ).finish(stage_unlocked(achievement, stage))
 
     async def character_complete(self, user_id: str, character_id: str, at: datetime) -> None:
-        """The user completed the character `at`: recorded, as `daily_task_done` is."""
+        """The user completed the character `at`: recorded, as `achievement_unlocked` is."""
         await Recording(self, "achievement", user_id, character_id, at, False, False).finish(
             COMPLETE
         )
@@ -905,6 +926,20 @@ def read_reached_out_since(db: sqlite3.Connection, user_id: str, moment: datetim
     return count
 
 
+def read_replied_between(
+    db: sqlite3.Connection, user_id: str, start: datetime, end: datetime
+) -> int:
+    """How many of the user's comments on moments characters replied to from `start` till
+    `end`, as of when each began, read through `db`; only those that showed count, not those
+    that failed or were rejected."""
+    [count] = db.execute(
+        "SELECT COUNT(*) FROM activity_records WHERE user_id = ? AND started_at >= ?"
+        " AND started_at < ? AND kind = 'moment_reply' AND result = 'success'",
+        (user_id, start.timestamp(), end.timestamp()),
+    ).fetchone()
+    return count
+
+
 @dataclass(frozen=True)
 class _Written:
     """A record handed in to be written: with the service calls made in it so far."""
@@ -932,13 +967,25 @@ def _open(db: sqlite3.Connection) -> None:
     _add_stripped_tags_column(db)
     _add_judgement_columns(db)
     _add_answered_column(db)
+    _add_degraded_column(db)
     _forget_own_llms(db)
 
 
 def _open_rollups(db: sqlite3.Connection) -> None:
     """Make the rollups, from the records should there be none."""
     db.executescript(_ROLLUP_SCHEMA + _answered_trigger())
+    _forget_daily_tasks(db)
     _roll_up_all(db)
+
+
+def _forget_daily_tasks(db: sqlite3.Connection) -> None:
+    """Daily tasks done were recorded, and rolled up, until they were retired; a database of
+    theirs is left with none of them. Deleting records is only asked where there are any:
+    else one with no table of users, as a test's may be, refuses it."""
+    daily_task_records = "FROM activity_records WHERE kind = 'daily_task'"
+    if db.execute(f"SELECT EXISTS (SELECT 1 {daily_task_records})").fetchone()[0]:
+        db.execute(f"DELETE {daily_task_records}")
+    db.execute("DELETE FROM record_rollups WHERE kind = 'daily_task'")
 
 
 def _insert_records(db: sqlite3.Connection, written: list[_Written], anonymous: str) -> None:
@@ -969,12 +1016,13 @@ def _insert(
         recording.call.row_id if recording.call is not None else None,
         recording.duration_s, recording.end_reason, *_writing_judgement(recording),
         recording.ended_conversation,
+        json.dumps(recording.degraded) if recording.degraded else None,
     )
     insert = (
         "INSERT INTO activity_records (user_id, anonymous_id, kind, character_id,"
         " started_at, result, own_keys, time_to_speak_ms, call_id, duration_s, end_reason,"
-        f" {', '.join(JUDGEMENT_COLUMNS)}, ended_conversation)"
-        f" VALUES ({', '.join('?' * (12 + len(JUDGEMENT_COLUMNS)))})"
+        f" {', '.join(JUDGEMENT_COLUMNS)}, ended_conversation, degraded)"
+        f" VALUES ({', '.join('?' * (13 + len(JUDGEMENT_COLUMNS)))})"
     )
     try:
         cursor = db.execute(insert, (recording.user_id, None, *row))
@@ -1441,9 +1489,9 @@ def _time(epoch: float) -> datetime:
 
 
 def _writing_own_keys(recording: Recording) -> bool:
-    """What is written to the `own_keys` column of a record, by its kind: a turn's own
-    LLM, a call's being exempt."""
-    if recording.kind == "turn":
+    """What is written to the `own_keys` column of a record, by its kind: a turn's or
+    visit's own LLM, a call's being exempt."""
+    if recording.kind in OWN_LLM_KINDS:
         return recording.own_llm
     assert recording.exempt is not None
     return recording.exempt
@@ -1452,7 +1500,7 @@ def _writing_own_keys(recording: Recording) -> bool:
 def _reading_own_keys(kind: RecordKind, kept: int) -> tuple[bool | None, bool | None]:
     """`RecordRow.own_llm` and `RecordRow.exempt`, from what is read of the `own_keys`
     column of a record of `kind`."""
-    return (bool(kept), None) if kind == "turn" else (None, bool(kept))
+    return (bool(kept), None) if kind in OWN_LLM_KINDS else (None, bool(kept))
 
 
 def _writing_judgement(recording: Recording) -> tuple[int | None, ...]:
@@ -1493,6 +1541,14 @@ def _add_answered_column(db: sqlite3.Connection) -> None:
         db.execute(
             "ALTER TABLE activity_records ADD COLUMN answered INTEGER NOT NULL DEFAULT 0"
         )
+
+
+def _add_degraded_column(db: sqlite3.Connection) -> None:
+    """Records written before moments were posted have no column for what of them was made
+    do without: none were."""
+    columns = {name for _, name, *_ in db.execute("PRAGMA table_info(activity_records)")}
+    if "degraded" not in columns:
+        db.execute("ALTER TABLE activity_records ADD COLUMN degraded TEXT")
 
 
 def _add_llm_columns(db: sqlite3.Connection) -> None:
@@ -1738,9 +1794,11 @@ class MeteredJudge:
         text: str,
         affinity: bool = False,
         photo: bool = False,
+        days: Days | None = None,
     ) -> "tuple[Need, Judged | None, bool]":
         return await timed(
-            self._log, self._origin, self._judge.judge(character, history, text, affinity, photo)
+            self._log, self._origin,
+            self._judge.judge(character, history, text, affinity, photo, days),
         )
 
 
@@ -1760,9 +1818,11 @@ class MeteredAffinityJudge:
         text: str,
         affinity: bool = True,
         photo: bool = False,
+        days: Days | None = None,
     ) -> "tuple[Judged | None, bool]":
         return await timed(
-            self._log, self._origin, self._judge.judge(character, history, text, affinity, photo)
+            self._log, self._origin,
+            self._judge.judge(character, history, text, affinity, photo, days),
         )
 
 
